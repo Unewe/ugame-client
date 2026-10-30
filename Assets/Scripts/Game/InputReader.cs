@@ -29,14 +29,18 @@ namespace UGame.Game
             return Vector2.ClampMagnitude(v, 1f);
         }
 
-        /// <summary>Атака: левая кнопка мыши или пробел (удержание — стрельба очередью).</summary>
-        public static bool Attack()
+        /// <summary>
+        /// Атака: левая кнопка мыши или пробел (удержание — стрельба очередью).
+        /// При сенсорном управлении мышь не учитываем: на телефоне и в Device Simulator
+        /// касание экрана тоже выглядит как нажатие мыши.
+        /// </summary>
+        public static bool Attack(bool includeMouse)
         {
 #if ENABLE_INPUT_SYSTEM
-            return (Mouse.current != null && Mouse.current.leftButton.isPressed)
+            return (includeMouse && Mouse.current != null && Mouse.current.leftButton.isPressed)
                    || (Keyboard.current != null && Keyboard.current.spaceKey.isPressed);
 #else
-            return Input.GetMouseButton(0) || Input.GetKey(KeyCode.Space);
+            return (includeMouse && Input.GetMouseButton(0)) || Input.GetKey(KeyCode.Space);
 #endif
         }
 

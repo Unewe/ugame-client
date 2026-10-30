@@ -53,6 +53,17 @@ namespace UGame.Game
         {
             Application.runInBackground = true; // второй клиент в фоне не должен «замерзать»
             Application.targetFrameRate = 120;
+            if (Application.isMobilePlatform)
+            {
+                // играем только в альбомной ориентации, экран не гаснет
+                Screen.autorotateToPortrait = false;
+                Screen.autorotateToPortraitUpsideDown = false;
+                Screen.autorotateToLandscapeLeft = true;
+                Screen.autorotateToLandscapeRight = true;
+                Screen.orientation = ScreenOrientation.AutoRotation;
+                Screen.sleepTimeout = SleepTimeout.NeverSleep;
+                Application.targetFrameRate = 60; // бережём батарею
+            }
             serverUrl = PlayerPrefs.GetString(PrefServerUrl, "http://localhost:8080");
             username = PlayerPrefs.GetString(PrefUsername, "");
         }
@@ -327,6 +338,8 @@ namespace UGame.Game
             GUI.enabled = !busy;
             GUILayout.Label("Сервер", small);
             serverUrl = GUILayout.TextField(serverUrl, GUILayout.Height(32));
+            if (TouchControls.Available && serverUrl.Contains("localhost"))
+                GUILayout.Label("На телефоне укажите IP компьютера с сервером, например http://192.168.1.10:8080", errorStyle);
             GUILayout.Label("Имя игрока", small);
             username = GUILayout.TextField(username, 16, GUILayout.Height(32));
             if (registerMode)
@@ -373,7 +386,9 @@ namespace UGame.Game
 
             if (!string.IsNullOrEmpty(error)) GUILayout.Label(error, errorStyle);
             GUILayout.FlexibleSpace();
-            GUILayout.Label("Управление: WASD — движение, мышь — прицел, ЛКМ или пробел — выстрел", small);
+            GUILayout.Label(TouchControls.Available
+                ? "Управление: левый джойстик — движение; правый — тяните, чтобы прицелиться, отпустите — выстрел; короткое касание — автоприцел"
+                : "Управление: WASD — движение, мышь — прицел, ЛКМ или пробел — выстрел", small);
             GUILayout.EndArea();
         }
 

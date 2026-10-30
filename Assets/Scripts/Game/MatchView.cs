@@ -91,6 +91,17 @@ namespace UGame.Game
         Camera cam;
         Vector3 camTarget;
 
+        // сенсорное управление (телефон или Device Simulator)
+        TouchControls touch;
+        Transform aimLine;
+        const float ProjectileRange = 8f;   // как PROJECTILE_RANGE в World.java
+        const float AutoAimRange = 10f;
+        const float AttackCooldown = 0.5f;  // как ATTACK_COOLDOWN_SEC в World.java
+        float fireReadyAt;
+        bool queuedFire;
+        float queuedAim;
+        public bool TouchMode => touch != null;
+
         // ------------------------------------------------------------------ жизненный цикл
 
         public static MatchView Create(GameConnection connection, JoinResult join)
@@ -104,6 +115,7 @@ namespace UGame.Game
             view.tickDt = 1f / view.tickRate;
             view.BuildArena();
             view.SetupCamera();
+            if (TouchControls.Available) view.touch = new TouchControls();
             return view;
         }
 
@@ -152,6 +164,7 @@ namespace UGame.Game
                 MyAlive = false;
                 predicting = false;
                 pending.Clear();
+                queuedFire = false;
                 return;
             }
             MyAlive = true;
@@ -201,10 +214,12 @@ namespace UGame.Game
         /// <summary>Вызывается GameClient каждый кадр после приёма пакетов.</summary>
         public void Tick(float dt)
         {
+            touch?.Update();
             if (Running && MyAlive) SendInputs(dt);
             AdvanceClock(dt);
             smoothOffset = Vector2.Lerp(smoothOffset, Vector2.zero, 1f - Mathf.Exp(-12f * dt));
             UpdateViews();
+            UpdateAimLine();
             UpdateCamera(dt);
         }
 
@@ -224,9 +239,16 @@ namespace UGame.Game
         void SendOneCommand()
         {
             Vector2 move = InputReader.Move();
-            if (myTeam == 1) move = -move; // камера команды 1 развёрнута на 180°
+            if (touch != null && touch.Move.sqrMagnitude > move.sqrMagnitude) move = touch.Move;
+            move = ScreenToWorldDir(move);
 
-            UpdateAim();
+            bool fire;
+            if (touch != null) fire = TouchFire(move) | InputReader.Attack(includeMouse: false);
+            else
+            {
+                UpdateAim();
+                fire = InputReader.Attack(includeMouse: true);
+            }
             int qx = Quantize.AxisToI8(move.x);
             int qy = Quantize.AxisToI8(move.y);
 
@@ -236,7 +258,7 @@ namespace UGame.Game
                 MoveX = (sbyte)qx,
                 MoveY = (sbyte)qy,
                 Aim = (ushort)Quantize.AngleToU16(myAim),
-                Buttons = InputReader.Attack() ? Buttons.Attack : Buttons.None,
+                Buttons = fire ? Buttons.Attack : Buttons.None,
             };
             if (nextSeq == 0) nextSeq = 1;
 
@@ -252,6 +274,90 @@ namespace UGame.Game
                 pending.Add(new Pending { Seq = cmd.Seq, Mx = mx, My = my });
                 if (pending.Count > MaxPending) pending.RemoveAt(0);
             }
+        }
+
+        /// <summary>Направление «на экране» → направление на арене (камера команды 1 развёрнута на 180°).</summary>
+        Vector2 ScreenToWorldDir(Vector2 v) => myTeam == 1 ? -v : v;
+
+        /// <summary>
+        /// Выстрел с телефона — разовое нажатие. Если оно пришлось на перезарядку, сервер бы его
+        /// проигнорировал, поэтому выстрел ждёт конца перезарядки и уходит с тем же прицелом.
+        /// </summary>
+        bool TouchFire(Vector2 worldMove)
+        {
+            if (TouchAim(worldMove))
+            {
+                queuedFire = true;
+                queuedAim = myAim;
+            }
+            if (!queuedFire || Time.time < fireReadyAt) return false;
+            queuedFire = false;
+            myAim = queuedAim;
+            fireReadyAt = Time.time + AttackCooldown + 0.05f;
+            return true;
+        }
+
+        /// <summary>Прицел при сенсорном управлении. Возвращает true, если игрок запросил выстрел.</summary>
+        bool TouchAim(Vector2 worldMove)
+        {
+            var fire = touch.ConsumeFire(out Vector2 fireDir);
+            if (fire == TouchControls.FireKind.Aimed)
+            {
+                SetAim(ScreenToWorldDir(fireDir));
+                return true;
+            }
+            if (fire == TouchControls.FireKind.Auto)
+            {
+                if (NearestEnemy(out Vector2 enemy)) SetAim(enemy - OwnRenderPos());
+                return true;
+            }
+            if (touch.Aiming) SetAim(ScreenToWorldDir(touch.AimDirection));
+            else if (worldMove.sqrMagnitude > 0.01f) SetAim(worldMove); // без прицеливания смотрим, куда идём
+            return false;
+        }
+
+        void SetAim(Vector2 worldDir)
+        {
+            if (worldDir.sqrMagnitude > 0.0001f) myAim = Mathf.Atan2(worldDir.y, worldDir.x);
+        }
+
+        bool NearestEnemy(out Vector2 pos)
+        {
+            pos = default;
+            Vector2 own = OwnRenderPos();
+            float best = AutoAimRange * AutoAimRange;
+            bool found = false;
+            foreach (var v in views.Values)
+            {
+                if (v.Kind != EntityKind.Brawler || v.Team == myTeam || !v.Root.activeSelf) continue;
+                Vector2 p = new Vector2(v.WorldPos.x, v.WorldPos.z);
+                float d = (p - own).sqrMagnitude;
+                if (d < best) { best = d; pos = p; found = true; }
+            }
+            return found;
+        }
+
+        /// <summary>Линия выстрела на земле, пока игрок целится джойстиком.</summary>
+        void UpdateAimLine()
+        {
+            bool show = touch != null && touch.Aiming && Running && MyAlive && predicting;
+            if (!show)
+            {
+                if (aimLine != null && aimLine.gameObject.activeSelf) aimLine.gameObject.SetActive(false);
+                return;
+            }
+            if (aimLine == null)
+            {
+                aimLine = Primitive(PrimitiveType.Cube, transform, new Color(1f, 1f, 1f));
+                aimLine.GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            }
+            aimLine.gameObject.SetActive(true);
+            Vector2 dir = ScreenToWorldDir(touch.AimDirection);
+            Vector2 own = OwnRenderPos();
+            Vector3 d3 = new Vector3(dir.x, 0f, dir.y);
+            aimLine.position = new Vector3(own.x, 0.05f, own.y) + d3 * (ProjectileRange / 2f + BrawlerRadius);
+            aimLine.rotation = Quaternion.LookRotation(d3);
+            aimLine.localScale = new Vector3(0.3f, 0.02f, ProjectileRange);
         }
 
         void UpdateAim()
@@ -466,6 +572,7 @@ namespace UGame.Game
         public void DrawOverlay(float guiScale, GUIStyle nameStyle)
         {
             if (cam == null) return;
+            if (touch != null && Running && MyAlive) touch.Draw(guiScale);
             foreach (var v in views.Values)
             {
                 if (v.Kind != EntityKind.Brawler || !v.Root.activeSelf) continue;
