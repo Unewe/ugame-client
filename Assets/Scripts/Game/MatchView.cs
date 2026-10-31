@@ -494,14 +494,26 @@ namespace UGame.Game
             return new View { Root = root, Kind = e.Kind, Id = e.Id };
         }
 
+        // Материал из Resources (создаёт Editor/UGamePrimitiveMaterial.cs). Материал по умолчанию
+        // от CreatePrimitive брать нельзя: его шейдер вырезается из сборки и на телефоне всё фиолетовое.
+        static Material primitiveMaterial;
+
         static Transform Primitive(PrimitiveType type, Transform parent, Color color)
         {
             var go = GameObject.CreatePrimitive(type);
             Destroy(go.GetComponent<Collider>()); // физика не нужна — всё считает сервер
             go.transform.SetParent(parent, false);
-            // материал по умолчанию подходит к текущему рендер-пайплайну (URP);
-            // .color пишет в основной цвет шейдера (_BaseColor у URP Lit)
-            go.GetComponent<Renderer>().material.color = color;
+
+            if (primitiveMaterial == null)
+            {
+                primitiveMaterial = Resources.Load<Material>("UGame/PrimitiveLit");
+                if (primitiveMaterial == null)
+                    Debug.LogError("[UGame] Нет Resources/UGame/PrimitiveLit.mat — объекты в сборке будут фиолетовыми");
+            }
+            var r = go.GetComponent<Renderer>();
+            if (primitiveMaterial != null) r.sharedMaterial = primitiveMaterial;
+            // .material создаёт копию для объекта; .color пишет в _BaseColor у URP Lit
+            r.material.color = color;
             return go.transform;
         }
 
