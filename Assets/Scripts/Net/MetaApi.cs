@@ -1,4 +1,4 @@
-// HTTP-клиент мета-сервиса (Spring WebFlux): регистрация, вход, профиль, матчмейкинг.
+// HTTP-клиент мета-сервиса (Spring WebFlux): гостевой вход, регистрация, вход, профиль, матчмейкинг.
 using System;
 using System.Text;
 using System.Threading.Tasks;
@@ -19,7 +19,17 @@ namespace UGame.Net
         public long expiresIn;
         public long playerId;
         public string username;
+        public bool guest;
     }
+
+    /// <summary>Ответ /api/auth/guest: токены и сгенерированный сервером пароль гостя.</summary>
+    [Serializable]
+    public class GuestResponse : TokenResponse
+    {
+        public string password;
+    }
+
+    [Serializable] class HealthResponse { public string status; }
 
     [Serializable]
     public class Profile
@@ -29,6 +39,7 @@ namespace UGame.Net
         public int trophies;
         public int matchesPlayed;
         public int wins;
+        public bool guest;
     }
 
     [Serializable]
@@ -64,10 +75,57 @@ namespace UGame.Net
     public sealed class MetaApi
     {
         public string BaseUrl { get; }
-        public TokenResponse Tokens { get; private set; }
         public bool LoggedIn => Tokens != null;
 
+        /// <summary>
+        /// Новые токены (вход, регистрация, автоматическое обновление). Refresh-токен одноразовый —
+        /// сервер меняет его при каждом обновлении, поэтому сохранять нужно каждый новый.
+        /// </summary>
+        public event Action<TokenResponse> TokensChanged;
+
+        TokenResponse tokens;
+        public TokenResponse Tokens
+        {
+            get => tokens;
+            private set
+            {
+                tokens = value;
+                if (value != null) TokensChanged?.Invoke(value);
+            }
+        }
+
         public MetaApi(string baseUrl) { BaseUrl = baseUrl.Trim().TrimEnd('/'); }
+
+        /// <summary>
+        /// Доступен ли сервер. Любой HTTP-ответ — да; нет соединения или истёк таймаут — нет.
+        /// </summary>
+        public async Task<bool> Ping(int timeoutSec = 5)
+        {
+            try
+            {
+                await SendOnce<HealthResponse>("GET", "/actuator/health", null, false, timeoutSec);
+                return true;
+            }
+            catch (ApiException e) { return e.Code != "network_error"; }
+        }
+
+        /// <summary>Новый гостевой аккаунт. Пароль из ответа нужно сохранить: другого способа войти в этот аккаунт нет.</summary>
+        public async Task<GuestResponse> Guest()
+        {
+            var g = await Send<GuestResponse>("POST", "/api/auth/guest", null, auth: false);
+            Tokens = g;
+            return g;
+        }
+
+        /// <summary>Гость задаёт своё имя, email и пароль; кубки и статистика сохраняются.</summary>
+        public async Task Upgrade(string username, string email, string password) =>
+            Tokens = await Send<TokenResponse>("POST", "/api/auth/upgrade",
+                new RegisterRequest { username = username, email = string.IsNullOrWhiteSpace(email) ? null : email, password = password });
+
+        /// <summary>Вход по сохранённому refresh-токену.</summary>
+        public async Task Resume(string refreshToken) =>
+            Tokens = await SendOnce<TokenResponse>("POST", "/api/auth/refresh",
+                new RefreshRequest { refreshToken = refreshToken }, auth: false);
 
         public async Task Register(string username, string email, string password) =>
             Tokens = await Send<TokenResponse>("POST", "/api/auth/register",
@@ -82,7 +140,7 @@ namespace UGame.Net
         {
             if (Tokens == null) return;
             var refresh = Tokens.refreshToken;
-            Tokens = null;
+            tokens = null;
             try { await Send<object>("POST", "/api/auth/logout", new RefreshRequest { refreshToken = refresh }, auth: false); }
             catch (ApiException) { /* токен и так забыт на клиенте */ }
         }
@@ -107,11 +165,11 @@ namespace UGame.Net
             }
         }
 
-        async Task<T> SendOnce<T>(string method, string path, object body, bool auth)
+        async Task<T> SendOnce<T>(string method, string path, object body, bool auth, int timeoutSec = 10)
         {
             using var req = new UnityWebRequest(BaseUrl + path, method);
             req.downloadHandler = new DownloadHandlerBuffer();
-            req.timeout = 10;
+            req.timeout = timeoutSec;
             if (body != null)
             {
                 req.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(JsonUtility.ToJson(body)));

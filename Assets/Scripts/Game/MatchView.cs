@@ -284,7 +284,7 @@ namespace UGame.Game
 
         // ------------------------------------------------------------------ кадр
 
-        /// <summary>Вызывается GameClient каждый кадр после приёма пакетов.</summary>
+        /// <summary>Вызывается GameController каждый кадр, после того как GameClient принял пакеты.</summary>
         public void Tick(float dt)
         {
             if (touch != null)
