@@ -44,6 +44,20 @@ namespace UGame.Game
 #endif
         }
 
+        /// <summary>
+        /// Атака нажата в этом кадре. Нужна, чтобы короткий клик между двумя командами (они уходят
+        /// 30 раз в секунду, а кадров больше) не терялся.
+        /// </summary>
+        public static bool AttackPressed(bool includeMouse)
+        {
+#if ENABLE_INPUT_SYSTEM
+            return (includeMouse && Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
+                   || (Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame);
+#else
+            return (includeMouse && Input.GetMouseButtonDown(0)) || Input.GetKeyDown(KeyCode.Space);
+#endif
+        }
+
         /// <summary>Супер удар: E или правая кнопка мыши (срабатывает на нажатие).</summary>
         public static bool SuperPressed(bool includeMouse)
         {

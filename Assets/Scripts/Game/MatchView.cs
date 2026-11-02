@@ -3,6 +3,8 @@
 // Сервер авторитарный: клиент шлёт только ввод (30 раз в секунду), сервер присылает снапшоты.
 // * Свой боец — client-side prediction: двигаем его сразу, а по снапшоту берём позицию сервера
 //   и заново применяем ещё не подтверждённые команды (reconciliation). Расхождение сглаживается.
+//   Сервер выполняет команды по одной за тик тем же шагом (World.runCommand), поэтому поправок
+//   почти не бывает — только когда вмешался кто-то другой.
 // * Чужие бойцы и снаряды — интерполяция между снапшотами с задержкой ~100 мс.
 // * Свои выстрелы тоже предсказываются: снаряд появляется сразу при нажатии, а серверная копия
 //   (у снаряда в снапшоте есть id владельца) не рисуется. Сервер проверяет попадания по позициям
@@ -88,6 +90,7 @@ namespace UGame.Game
         readonly Dictionary<ushort, EntityState> fromById = new Dictionary<ushort, EntityState>();
         double renderTick;
         bool clockStarted;
+        double latestArrival;   // Time.timeAsDouble прихода Latest
 
         // предсказание
         struct Pending { public ushort Seq; public float Mx, My, Aim; public bool Dodge; }
@@ -110,6 +113,7 @@ namespace UGame.Game
 
         // способности: нажатия запоминаются в кадре и уходят со следующей командой
         bool superQueued, dodgeQueued;
+        bool attackQueued;      // клик, который ещё не ушёл (короче интервала команд или на перезарядке)
         bool superInFlight;     // супер отправлен, сервер ещё не подтвердил команду
         ushort superSentSeq;
         public bool SuperReady => Latest != null && Latest.SuperReady && !superInFlight;
@@ -208,6 +212,7 @@ namespace UGame.Game
             buffer.Add(s);
             if (buffer.Count > MaxSnapshots) buffer.RemoveAt(0);
             Latest = s;
+            latestArrival = Time.timeAsDouble;
 
             if (!clockStarted)
             {
@@ -227,7 +232,7 @@ namespace UGame.Game
                 predicting = false;
                 pending.Clear();
                 queuedFire = false;
-                superQueued = dodgeQueued = superInFlight = false;
+                superQueued = dodgeQueued = superInFlight = attackQueued = false;
                 dash = new DashState { Cooldown = s.DodgeCooldownTicks };
                 return;
             }
@@ -236,7 +241,9 @@ namespace UGame.Game
             if (superInFlight && !Quantize.SeqGreater(superSentSeq, s.AckInputSeq)) superInFlight = false;
 
             // команды, которые сервер уже применил, больше не нужны
-            pending.RemoveAll(p => !Quantize.SeqGreater(p.Seq, s.AckInputSeq));
+            int acked = 0;
+            while (acked < pending.Count && !Quantize.SeqGreater(pending[acked].Seq, s.AckInputSeq)) acked++;
+            if (acked > 0) pending.RemoveRange(0, acked);
 
             // состояние сервера на момент снапшота + повтор неподтверждённых команд
             var d = new DashState { Cooldown = s.DodgeCooldownTicks, DashLeft = s.DashTicksLeft };
@@ -348,6 +355,7 @@ namespace UGame.Game
                 if (touch.ConsumeDodge()) dodgeQueued = true;
             }
             if (InputReader.SuperPressed(includeMouse: touch == null)) superQueued = true;
+            if (InputReader.AttackPressed(includeMouse: touch == null)) attackQueued = true;
             if (InputReader.DodgePressed()) dodgeQueued = true;
             if (Running && MyAlive) SendInputs(dt);
             AdvanceClock(dt);
@@ -387,12 +395,13 @@ namespace UGame.Game
                 // супер и обычный выстрел в одной команде не шлём: у них разный прицел,
                 // а выстрел из очереди спокойно уйдёт следующей командой
                 super = TouchSuper();
-                fire = !super && (TouchFire(move, attackReady) | (attackReady && InputReader.Attack(includeMouse: false)));
+                fire = !super && (TouchFire(move, attackReady)
+                                  | (attackReady && (attackQueued || InputReader.Attack(includeMouse: false))));
             }
             else
             {
                 UpdateAim();
-                fire = attackReady && InputReader.Attack(includeMouse: true);
+                fire = attackReady && (attackQueued || InputReader.Attack(includeMouse: true));
             }
             if (superQueued && SuperReady) super = true;
             superQueued = false;
@@ -418,7 +427,11 @@ namespace UGame.Game
                 Buttons = buttons,
             };
             if (nextSeq == 0) nextSeq = 1;
-            if (fire) lastShotSeq = cmd.Seq;
+            if (fire)
+            {
+                lastShotSeq = cmd.Seq;
+                attackQueued = false;
+            }
             if (super)
             {
                 superInFlight = true;
@@ -576,14 +589,20 @@ namespace UGame.Game
             return Vector2.Lerp(prevPredicted, predicted, t) + smoothOffset;
         }
 
+        /// <summary>
+        /// Время отрисовки чужих сущностей. Цель — «сейчас на сервере» минус задержка интерполяции;
+        /// «сейчас» = тик последнего снапшота + сколько прошло с его прихода. Без этой поправки цель
+        /// прыгала бы на тик с каждым снапшотом, и чужие бойцы ехали бы рывками (то быстрее, то медленнее).
+        /// Подстраиваемся скоростью хода часов (±10 %), а не сдвигом, — так движение остаётся плавным.
+        /// </summary>
         void AdvanceClock(float dt)
         {
             if (!clockStarted || Latest == null) return;
-            renderTick += dt * tickRate;
-            double target = Latest.Tick - InterpDelayTicks;
+            double serverNow = Latest.Tick + (Time.timeAsDouble - latestArrival) * tickRate;
+            double target = serverNow - InterpDelayTicks;
             double diff = target - renderTick;
             if (diff > 10 || diff < -10) renderTick = target;               // сильно отстали/убежали
-            else renderTick += diff * Mathf.Min(1f, dt * 2f);              // мягкая подстройка
+            else renderTick += dt * tickRate * (1.0 + System.Math.Clamp(diff * 0.1, -0.1, 0.1));
             if (renderTick > Latest.Tick) renderTick = Latest.Tick;        // без экстраполяции
         }
 
@@ -889,6 +908,8 @@ namespace UGame.Game
 
         // ------------------------------------------------------------------ подписи над головами
 
+        GUIStyle abilityStyle; // создаём один раз: OnGUI вызывается несколько раз за кадр
+
         /// <summary>Заряд супера и кулдаун рывка внизу экрана (управление мышью и клавиатурой).</summary>
         void DrawAbilityBar(float guiScale)
         {
@@ -902,7 +923,8 @@ namespace UGame.Game
             GUI.color = SuperReady ? new Color(1f, 0.85f, 0.1f) : new Color(0.75f, 0.65f, 0.2f);
             GUI.DrawTexture(new Rect(x, y, bw * SuperCharge01, bh), Texture2D.whiteTexture);
             GUI.color = Color.white;
-            var center = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, fontSize = 13 };
+            abilityStyle ??= new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, fontSize = 13 };
+            var center = abilityStyle;
             GUI.Label(new Rect(x, y - 1, bw, bh + 2),
                 SuperReady ? "СУПЕР ГОТОВ — E / ПКМ" : $"Супер {Mathf.FloorToInt(SuperCharge01 * 100f)}%", center);
 
