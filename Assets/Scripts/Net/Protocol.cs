@@ -97,7 +97,7 @@ namespace UGame.Net
     }
 
     [Flags]
-    public enum Buttons : byte { None = 0, Attack = 1, Super = 2 }
+    public enum Buttons : byte { None = 0, Attack = 1, Super = 2, Dodge = 4 }
 
     public struct InputCommand
     {
@@ -126,6 +126,15 @@ namespace UGame.Net
 
     public enum EntityKind : byte { Brawler = 1, Projectile = 2 }
 
+    [Flags]
+    public enum EntityFlags : byte
+    {
+        None = 0,
+        Dodging = 1,      // боец в рывке и неуязвим
+        SuperReady = 2,   // у бойца заряжен супер
+        SuperShot = 4,    // снаряд супер удара
+    }
+
     public struct EntityState
     {
         public ushort Id;
@@ -134,6 +143,7 @@ namespace UGame.Net
         public float Aim;     // радианы
         public float Hp01;    // 0..1, 0 — мёртв
         public byte Team;
+        public EntityFlags Flags;
     }
 
     public sealed class Snapshot
@@ -142,6 +152,14 @@ namespace UGame.Net
         public ushort AckInputSeq;
         public ushort TimeLeftSec;
         public byte Score0, Score1;
+
+        // состояние СВОЕГО бойца (сервер шлёт каждому клиенту его собственное)
+        public byte SuperCharge;          // 0..255, 255 — супер готов
+        public ushort DodgeCooldownTicks; // 0 — уклонение готово
+        public byte DashTicksLeft;        // > 0 — идёт рывок
+        public ushort DashAngle;          // направление рывка, 0..65535
+
+        public bool SuperReady => SuperCharge >= 255;
         public readonly List<EntityState> Entities = new List<EntityState>();
 
         /// <summary>Читает пакет БЕЗ первого байта типа.</summary>
@@ -154,6 +172,10 @@ namespace UGame.Net
                 TimeLeftSec = (ushort)r.U16(),
                 Score0 = (byte)r.U8(),
                 Score1 = (byte)r.U8(),
+                SuperCharge = (byte)r.U8(),
+                DodgeCooldownTicks = (ushort)r.U16(),
+                DashTicksLeft = (byte)r.U8(),
+                DashAngle = (ushort)r.U16(),
             };
             int count = r.U8();
             for (int i = 0; i < count; i++)
@@ -166,6 +188,7 @@ namespace UGame.Net
                     Aim = Quantize.U16ToAngle(r.U16()),
                     Hp01 = r.U8() / 255f,
                     Team = (byte)r.U8(),
+                    Flags = (EntityFlags)r.U8(),
                 });
             }
             return s;

@@ -4,8 +4,10 @@
 // * Свой боец — client-side prediction: двигаем его сразу, а по снапшоту берём позицию сервера
 //   и заново применяем ещё не подтверждённые команды (reconciliation). Расхождение сглаживается.
 // * Чужие бойцы и снаряды — интерполяция между снапшотами с задержкой ~100 мс.
+// * Рывок (уклонение) тоже предсказывается: сервер присылает своему игроку кулдаун и остаток
+//   рывка, клиент повторяет неподтверждённые команды той же логикой, что World.moveBrawler.
 //
-// Константы движения должны совпадать с World.java на сервере.
+// Константы движения, рывка и супера должны совпадать с World.java на сервере.
 using System.Collections.Generic;
 using UGame.Net;
 using UnityEngine;
@@ -19,6 +21,11 @@ namespace UGame.Game
         public const float ArenaHeight = 30f;
         const float BrawlerRadius = 0.5f;
         const float BrawlerSpeed = 5f;
+        const float DodgeCooldownSec = 5f;
+        const float DashDurationSec = 0.2f;
+        const float DashDistance = 4f;
+        const float SuperRange = 9f;
+        const float SuperSpreadDeg = 40f;
 
         const float InterpDelayTicks = 3f;   // 100 мс при 30 Гц
         const int MaxSnapshots = 40;
@@ -30,6 +37,9 @@ namespace UGame.Game
         static readonly Color EnemyColor = new Color(1.00f, 0.25f, 0.20f);
         static readonly Color AllyShotColor = new Color(0.45f, 0.95f, 1.00f);
         static readonly Color EnemyShotColor = new Color(1.00f, 0.60f, 0.10f);
+        static readonly Color SuperShotColor = new Color(1.00f, 0.85f, 0.10f);
+        static readonly Color SuperGlowColor = new Color(1.00f, 0.85f, 0.10f);
+        static readonly Color DodgeRingColor = new Color(0.85f, 1.00f, 1.00f);
 
         // разные цвета персонажей — по id сущности
         static readonly Color[] BrawlerPalette =
@@ -51,6 +61,8 @@ namespace UGame.Game
         int myTeam;
         int tickRate;
         float tickDt;
+        int dashTicks, dodgeCooldownTicks;
+        float dashStep;
 
         public bool Running { get; private set; }
         public bool Finished { get; private set; }
@@ -66,14 +78,33 @@ namespace UGame.Game
         bool clockStarted;
 
         // предсказание
-        struct Pending { public ushort Seq; public float Mx, My; }
+        struct Pending { public ushort Seq; public float Mx, My, Aim; public bool Dodge; }
+
+        /// <summary>Состояние рывка своего бойца — как поля Brawler в World.java.</summary>
+        struct DashState
+        {
+            public int Cooldown;   // тиков до готовности уклонения
+            public int DashLeft;   // тиков рывка осталось
+            public float Dx, Dy;
+        }
         readonly List<Pending> pending = new List<Pending>();
         readonly List<InputCommand> history = new List<InputCommand>(InputPacket.MaxCommands);
         ushort nextSeq = 1;
         float sendAcc;
         bool predicting;
         Vector2 predicted, prevPredicted, smoothOffset;
+        DashState dash;
         float myAim;
+
+        // способности: нажатия запоминаются в кадре и уходят со следующей командой
+        bool superQueued, dodgeQueued;
+        bool superInFlight;     // супер отправлен, сервер ещё не подтвердил команду
+        ushort superSentSeq;
+        public bool SuperReady => Latest != null && Latest.SuperReady && !superInFlight;
+        public float SuperCharge01 => Latest != null && !superInFlight ? Latest.SuperCharge / 255f : 0f;
+        public bool DodgeReady => dash.Cooldown == 0;
+        public float DodgeCooldownLeftSec => dash.Cooldown * tickDt;
+        public bool Dashing => dash.DashLeft > 0;
 
         // объекты сцены
         sealed class View
@@ -85,6 +116,7 @@ namespace UGame.Game
             public float Hp01;
             public byte Team;
             public ushort Id;
+            public Transform Body, Gun, Ring, SuperGlow;
         }
         readonly Dictionary<ushort, View> views = new Dictionary<ushort, View>();
         readonly List<ushort> toRemove = new List<ushort>();
@@ -93,7 +125,7 @@ namespace UGame.Game
 
         // сенсорное управление (телефон или Device Simulator)
         TouchControls touch;
-        Transform aimLine;
+        readonly Transform[] aimLines = new Transform[3]; // центр + края веера супера
         const float ProjectileRange = 8f;   // как PROJECTILE_RANGE в World.java
         const float AutoAimRange = 10f;
         const float AttackCooldown = 0.5f;  // как ATTACK_COOLDOWN_SEC в World.java
@@ -113,6 +145,10 @@ namespace UGame.Game
             view.myTeam = (int)join.Team;
             view.tickRate = join.TickRate > 0 ? (int)join.TickRate : 30;
             view.tickDt = 1f / view.tickRate;
+            // Math.round из Java: округление половины вверх
+            view.dashTicks = Mathf.Max(1, Mathf.FloorToInt(DashDurationSec * view.tickRate + 0.5f));
+            view.dodgeCooldownTicks = Mathf.FloorToInt(DodgeCooldownSec * view.tickRate + 0.5f);
+            view.dashStep = DashDistance / view.dashTicks;
             view.BuildArena();
             view.SetupCamera();
             if (TouchControls.Available) view.touch = new TouchControls();
@@ -165,15 +201,28 @@ namespace UGame.Game
                 predicting = false;
                 pending.Clear();
                 queuedFire = false;
+                superQueued = dodgeQueued = superInFlight = false;
+                dash = new DashState { Cooldown = s.DodgeCooldownTicks };
                 return;
             }
             MyAlive = true;
 
+            if (superInFlight && !Quantize.SeqGreater(superSentSeq, s.AckInputSeq)) superInFlight = false;
+
             // команды, которые сервер уже применил, больше не нужны
             pending.RemoveAll(p => !Quantize.SeqGreater(p.Seq, s.AckInputSeq));
 
+            // состояние сервера на момент снапшота + повтор неподтверждённых команд
+            var d = new DashState { Cooldown = s.DodgeCooldownTicks, DashLeft = s.DashTicksLeft };
+            if (d.DashLeft > 0)
+            {
+                float a = Quantize.U16ToAngle(s.DashAngle);
+                d.Dx = Mathf.Cos(a);
+                d.Dy = Mathf.Sin(a);
+            }
             Vector2 pos = own.Value.Pos;
-            foreach (var p in pending) pos = Step(pos, p.Mx, p.My, tickDt);
+            foreach (var p in pending) pos = Step(pos, ref d, p.Mx, p.My, p.Aim, p.Dodge);
+            dash = d;
 
             if (predicting)
             {
@@ -199,13 +248,37 @@ namespace UGame.Game
             return null;
         }
 
-        /// <summary>Шаг движения — точная копия World.moveBrawler на сервере.</summary>
-        static Vector2 Step(Vector2 p, float mx, float my, float dt)
+        /// <summary>Один тик своего бойца — копия World.step (кулдаун, начало рывка) и World.moveBrawler.</summary>
+        Vector2 Step(Vector2 p, ref DashState d, float mx, float my, float aim, bool dodge)
         {
-            float len = Mathf.Sqrt(mx * mx + my * my);
-            if (len > 1f) { mx /= len; my /= len; }
-            p.x = Mathf.Clamp(p.x + mx * BrawlerSpeed * dt, BrawlerRadius, ArenaWidth - BrawlerRadius);
-            p.y = Mathf.Clamp(p.y + my * BrawlerSpeed * dt, BrawlerRadius, ArenaHeight - BrawlerRadius);
+            if (d.Cooldown > 0) d.Cooldown--;
+            if (dodge && d.Cooldown == 0 && d.DashLeft == 0)
+            {
+                // как World.startDash: идём — рывок по движению, стоим — по прицелу; угол квантуется
+                float angle = (Mathf.Abs(mx) > 0.01f || Mathf.Abs(my) > 0.01f) ? Mathf.Atan2(my, mx) : aim;
+                float a = Quantize.U16ToAngle(Quantize.AngleToU16(angle));
+                d.Dx = Mathf.Cos(a);
+                d.Dy = Mathf.Sin(a);
+                d.DashLeft = dashTicks;
+                d.Cooldown = dodgeCooldownTicks;
+            }
+
+            float sx, sy;
+            if (d.DashLeft > 0)
+            {
+                sx = d.Dx * dashStep;
+                sy = d.Dy * dashStep;
+                d.DashLeft--;
+            }
+            else
+            {
+                float len = Mathf.Sqrt(mx * mx + my * my);
+                if (len > 1f) { mx /= len; my /= len; }
+                sx = mx * BrawlerSpeed * tickDt;
+                sy = my * BrawlerSpeed * tickDt;
+            }
+            p.x = Mathf.Clamp(p.x + sx, BrawlerRadius, ArenaWidth - BrawlerRadius);
+            p.y = Mathf.Clamp(p.y + sy, BrawlerRadius, ArenaHeight - BrawlerRadius);
             return p;
         }
 
@@ -214,7 +287,17 @@ namespace UGame.Game
         /// <summary>Вызывается GameClient каждый кадр после приёма пакетов.</summary>
         public void Tick(float dt)
         {
-            touch?.Update();
+            if (touch != null)
+            {
+                touch.SuperReady = SuperReady;
+                touch.SuperCharge01 = SuperCharge01;
+                touch.DodgeReady = DodgeReady;
+                touch.DodgeCooldownSec = DodgeCooldownLeftSec;
+                touch.Update();
+                if (touch.ConsumeDodge()) dodgeQueued = true;
+            }
+            if (InputReader.SuperPressed(includeMouse: touch == null)) superQueued = true;
+            if (InputReader.DodgePressed()) dodgeQueued = true;
             if (Running && MyAlive) SendInputs(dt);
             AdvanceClock(dt);
             smoothOffset = Vector2.Lerp(smoothOffset, Vector2.zero, 1f - Mathf.Exp(-12f * dt));
@@ -243,14 +326,33 @@ namespace UGame.Game
             move = ScreenToWorldDir(move);
 
             bool fire;
-            if (touch != null) fire = TouchFire(move) | InputReader.Attack(includeMouse: false);
+            bool super = false;
+            if (touch != null)
+            {
+                // супер и обычный выстрел в одной команде не шлём: у них разный прицел,
+                // а выстрел из очереди спокойно уйдёт следующей командой
+                super = TouchSuper();
+                fire = !super && (TouchFire(move) | InputReader.Attack(includeMouse: false));
+            }
             else
             {
                 UpdateAim();
                 fire = InputReader.Attack(includeMouse: true);
             }
+            if (superQueued && SuperReady) super = true;
+            superQueued = false;
+
+            // готовность рывка проверяет Step — ровно так же, как сервер; на кулдауне нажатие просто ничего не делает
+            bool dodge = dodgeQueued && !Dashing;
+            dodgeQueued = false;
+
             int qx = Quantize.AxisToI8(move.x);
             int qy = Quantize.AxisToI8(move.y);
+
+            var buttons = Buttons.None;
+            if (fire) buttons |= Buttons.Attack;
+            if (super) buttons |= Buttons.Super;
+            if (dodge) buttons |= Buttons.Dodge;
 
             var cmd = new InputCommand
             {
@@ -258,9 +360,14 @@ namespace UGame.Game
                 MoveX = (sbyte)qx,
                 MoveY = (sbyte)qy,
                 Aim = (ushort)Quantize.AngleToU16(myAim),
-                Buttons = fire ? Buttons.Attack : Buttons.None,
+                Buttons = buttons,
             };
             if (nextSeq == 0) nextSeq = 1;
+            if (super)
+            {
+                superInFlight = true;
+                superSentSeq = cmd.Seq;
+            }
 
             history.Insert(0, cmd);
             if (history.Count > InputPacket.MaxCommands) history.RemoveAt(history.Count - 1);
@@ -269,9 +376,10 @@ namespace UGame.Game
             if (predicting)
             {
                 float mx = Quantize.I8ToAxis(qx), my = Quantize.I8ToAxis(qy);
+                float aim = Quantize.U16ToAngle(cmd.Aim);
                 prevPredicted = predicted;
-                predicted = Step(predicted, mx, my, tickDt);
-                pending.Add(new Pending { Seq = cmd.Seq, Mx = mx, My = my });
+                predicted = Step(predicted, ref dash, mx, my, aim, dodge);
+                pending.Add(new Pending { Seq = cmd.Seq, Mx = mx, My = my, Aim = aim, Dodge = dodge });
                 if (pending.Count > MaxPending) pending.RemoveAt(0);
             }
         }
@@ -297,6 +405,16 @@ namespace UGame.Game
             return true;
         }
 
+        /// <summary>Супер удар с телефона. Прицел берётся из джойстика супера или по ближайшему врагу.</summary>
+        bool TouchSuper()
+        {
+            var kind = touch.ConsumeSuper(out Vector2 dir);
+            if (kind == TouchControls.FireKind.None || !SuperReady) return false;
+            if (kind == TouchControls.FireKind.Aimed) SetAim(ScreenToWorldDir(dir));
+            else if (NearestEnemy(out Vector2 enemy)) SetAim(enemy - OwnRenderPos());
+            return true;
+        }
+
         /// <summary>Прицел при сенсорном управлении. Возвращает true, если игрок запросил выстрел.</summary>
         bool TouchAim(Vector2 worldMove)
         {
@@ -312,6 +430,7 @@ namespace UGame.Game
                 return true;
             }
             if (touch.Aiming) SetAim(ScreenToWorldDir(touch.AimDirection));
+            else if (touch.SuperAiming) SetAim(ScreenToWorldDir(touch.SuperDirection));
             else if (worldMove.sqrMagnitude > 0.01f) SetAim(worldMove); // без прицеливания смотрим, куда идём
             return false;
         }
@@ -337,27 +456,42 @@ namespace UGame.Game
             return found;
         }
 
-        /// <summary>Линия выстрела на земле, пока игрок целится джойстиком.</summary>
+        /// <summary>
+        /// Линия выстрела на земле, пока игрок целится джойстиком. Для супера — три жёлтые линии:
+        /// центр и края веера.
+        /// </summary>
         void UpdateAimLine()
         {
-            bool show = touch != null && touch.Aiming && Running && MyAlive && predicting;
-            if (!show)
+            bool alive = touch != null && Running && MyAlive && predicting;
+            bool superAim = alive && touch.SuperAiming;
+            bool attackAim = alive && !superAim && touch.Aiming;
+            int count = superAim ? 3 : attackAim ? 1 : 0;
+
+            for (int i = 0; i < aimLines.Length; i++)
             {
-                if (aimLine != null && aimLine.gameObject.activeSelf) aimLine.gameObject.SetActive(false);
-                return;
+                if (i >= count)
+                {
+                    if (aimLines[i] != null && aimLines[i].gameObject.activeSelf) aimLines[i].gameObject.SetActive(false);
+                    continue;
+                }
+                if (aimLines[i] == null)
+                {
+                    aimLines[i] = Primitive(PrimitiveType.Cube, transform, Color.white);
+                    aimLines[i].GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                }
+                var line = aimLines[i];
+                line.gameObject.SetActive(true);
+                line.GetComponent<Renderer>().material.color = superAim ? SuperShotColor : Color.white;
+
+                Vector2 dir = ScreenToWorldDir(superAim ? touch.SuperDirection : touch.AimDirection);
+                float offset = i == 0 ? 0f : (i == 1 ? -0.5f : 0.5f) * SuperSpreadDeg;
+                float range = superAim ? SuperRange : ProjectileRange;
+                Vector3 d3 = Quaternion.Euler(0f, offset, 0f) * new Vector3(dir.x, 0f, dir.y);
+                Vector2 own = OwnRenderPos();
+                line.position = new Vector3(own.x, 0.05f, own.y) + d3 * (range / 2f + BrawlerRadius);
+                line.rotation = Quaternion.LookRotation(d3);
+                line.localScale = new Vector3(superAim && i == 0 ? 0.45f : 0.3f, 0.02f, range);
             }
-            if (aimLine == null)
-            {
-                aimLine = Primitive(PrimitiveType.Cube, transform, new Color(1f, 1f, 1f));
-                aimLine.GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-            }
-            aimLine.gameObject.SetActive(true);
-            Vector2 dir = ScreenToWorldDir(touch.AimDirection);
-            Vector2 own = OwnRenderPos();
-            Vector3 d3 = new Vector3(dir.x, 0f, dir.y);
-            aimLine.position = new Vector3(own.x, 0.05f, own.y) + d3 * (ProjectileRange / 2f + BrawlerRadius);
-            aimLine.rotation = Quaternion.LookRotation(d3);
-            aimLine.localScale = new Vector3(0.3f, 0.02f, ProjectileRange);
         }
 
         void UpdateAim()
@@ -432,7 +566,15 @@ namespace UGame.Game
                     pos = e.Pos;
                     aim = e.Aim;
                 }
-                if (isOwn) hp = FindOwn(Latest)?.Hp01 ?? hp; // своё здоровье — без задержки
+                var flags = e.Flags;
+                if (isOwn)
+                {
+                    var latestOwn = FindOwn(Latest);
+                    hp = latestOwn?.Hp01 ?? hp; // своё здоровье — без задержки
+                    if (latestOwn != null) flags = latestOwn.Value.Flags;
+                    if (predicting) // рывок своего бойца — по предсказанию, а не с опозданием на RTT
+                        flags = Dashing ? flags | EntityFlags.Dodging : flags & ~EntityFlags.Dodging;
+                }
 
                 if (!views.TryGetValue(e.Id, out var view))
                 {
@@ -449,6 +591,7 @@ namespace UGame.Game
                 view.WorldPos = new Vector3(pos.x, 0f, pos.y);
                 view.Root.transform.position = view.WorldPos;
                 view.Root.transform.rotation = Quaternion.LookRotation(new Vector3(Mathf.Cos(aim), 0f, Mathf.Sin(aim)));
+                if (e.Kind == EntityKind.Brawler) ApplyBrawlerFlags(view, flags);
             }
 
             toRemove.Clear();
@@ -461,11 +604,31 @@ namespace UGame.Game
             }
         }
 
+        /// <summary>
+        /// Рывок — боец «прижимается» к земле и подсвечивается кольцом (снаряды пролетают насквозь).
+        /// Заряженный супер — жёлтое свечение под ногами, видно и союзникам, и врагам.
+        /// </summary>
+        void ApplyBrawlerFlags(View v, EntityFlags flags)
+        {
+            bool dodging = (flags & EntityFlags.Dodging) != 0;
+            bool superReady = (flags & EntityFlags.SuperReady) != 0;
+            if (v.Body != null)
+            {
+                v.Body.localScale = dodging ? new Vector3(1.15f, 0.45f, 1.15f) : new Vector3(1f, 0.8f, 1f);
+                v.Body.localPosition = new Vector3(0f, dodging ? 0.45f : 0.8f, 0f);
+            }
+            if (v.Gun != null && v.Gun.gameObject.activeSelf == dodging) v.Gun.gameObject.SetActive(!dodging);
+            if (v.Ring != null)
+                v.Ring.GetComponent<Renderer>().material.color = dodging ? DodgeRingColor : v.Team == myTeam ? AllyColor : EnemyColor;
+            if (v.SuperGlow != null && v.SuperGlow.gameObject.activeSelf != superReady) v.SuperGlow.gameObject.SetActive(superReady);
+        }
+
         View CreateView(EntityState e)
         {
             var root = new GameObject(e.Kind + " " + e.Id);
             root.transform.SetParent(transform, false);
             bool ally = e.Team == myTeam;
+            var view = new View { Root = root, Kind = e.Kind, Id = e.Id, Team = e.Team };
 
             if (e.Kind == EntityKind.Brawler)
             {
@@ -473,25 +636,38 @@ namespace UGame.Game
                 var ring = Primitive(PrimitiveType.Cylinder, root.transform, ally ? AllyColor : EnemyColor);
                 ring.localScale = new Vector3(1.5f, 0.02f, 1.5f);
                 ring.localPosition = new Vector3(0f, 0.02f, 0f);
+                view.Ring = ring;
+
+                // свечение заряженного супера
+                var glow = Primitive(PrimitiveType.Cylinder, root.transform, SuperGlowColor);
+                glow.localScale = new Vector3(2.1f, 0.01f, 2.1f);
+                glow.localPosition = new Vector3(0f, 0.01f, 0f);
+                glow.GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                glow.gameObject.SetActive(false);
+                view.SuperGlow = glow;
 
                 // тело — свой цвет у каждого персонажа
                 var body = Primitive(PrimitiveType.Capsule, root.transform, BrawlerPalette[e.Id % BrawlerPalette.Length]);
                 body.localScale = new Vector3(1f, 0.8f, 1f);
                 body.localPosition = new Vector3(0f, 0.8f, 0f);
+                view.Body = body;
 
                 // «ствол» показывает направление прицела
                 var gun = Primitive(PrimitiveType.Cube, root.transform, new Color(0.15f, 0.15f, 0.15f));
                 gun.localScale = new Vector3(0.22f, 0.22f, 0.8f);
                 gun.localPosition = new Vector3(0f, 0.9f, 0.6f);
+                view.Gun = gun;
             }
             else
             {
-                var shot = Primitive(PrimitiveType.Sphere, root.transform, ally ? AllyShotColor : EnemyShotColor);
-                shot.localScale = Vector3.one * 0.35f;
+                bool superShot = (e.Flags & EntityFlags.SuperShot) != 0;
+                var shot = Primitive(PrimitiveType.Sphere, root.transform,
+                    superShot ? SuperShotColor : ally ? AllyShotColor : EnemyShotColor);
+                shot.localScale = Vector3.one * (superShot ? 0.65f : 0.35f);
                 shot.localPosition = new Vector3(0f, 0.7f, 0f);
                 shot.GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             }
-            return new View { Root = root, Kind = e.Kind, Id = e.Id };
+            return view;
         }
 
         // Материал из Resources (создаёт Editor/UGamePrimitiveMaterial.cs). Материал по умолчанию
@@ -580,11 +756,34 @@ namespace UGame.Game
 
         // ------------------------------------------------------------------ подписи над головами
 
+        /// <summary>Заряд супера и кулдаун рывка внизу экрана (управление мышью и клавиатурой).</summary>
+        void DrawAbilityBar(float guiScale)
+        {
+            float w = Screen.width / guiScale, h = Screen.height / guiScale;
+            const float bw = 260f, bh = 18f;
+            float x = (w - bw) / 2f, y = h - 70f;
+            var prev = GUI.color;
+
+            GUI.color = new Color(0f, 0f, 0f, 0.6f);
+            GUI.DrawTexture(new Rect(x - 2, y - 2, bw + 4, bh + 4), Texture2D.whiteTexture);
+            GUI.color = SuperReady ? new Color(1f, 0.85f, 0.1f) : new Color(0.75f, 0.65f, 0.2f);
+            GUI.DrawTexture(new Rect(x, y, bw * SuperCharge01, bh), Texture2D.whiteTexture);
+            GUI.color = Color.white;
+            var center = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, fontSize = 13 };
+            GUI.Label(new Rect(x, y - 1, bw, bh + 2),
+                SuperReady ? "СУПЕР ГОТОВ — E / ПКМ" : $"Супер {Mathf.FloorToInt(SuperCharge01 * 100f)}%", center);
+
+            GUI.Label(new Rect(x, y + bh + 4, bw, 20),
+                DodgeReady ? "Рывок готов — Shift" : $"Рывок через {DodgeCooldownLeftSec:0.0} с", center);
+            GUI.color = prev;
+        }
+
         /// <summary>Имена и полоски здоровья. Вызывается из OnGUI (координаты уже в масштабе GUI).</summary>
         public void DrawOverlay(float guiScale, GUIStyle nameStyle)
         {
             if (cam == null) return;
             if (touch != null && Running && MyAlive) touch.Draw(guiScale);
+            if (touch == null && Running && MyAlive) DrawAbilityBar(guiScale);
             foreach (var v in views.Values)
             {
                 if (v.Kind != EntityKind.Brawler || !v.Root.activeSelf) continue;

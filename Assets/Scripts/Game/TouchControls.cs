@@ -4,6 +4,9 @@
 // * Правая половина — джойстик атаки: тянете — целитесь (на земле видна линия выстрела),
 //   отпускаете — выстрел. Короткое касание без перетаскивания — выстрел с автоприцелом
 //   в ближайшего врага. Если вернуть палец в центр и отпустить — выстрел отменяется.
+// * Жёлтый джойстик левее атаки — супер удар. Работает так же, как атака, но только когда
+//   супер заряжен; пока не заряжен, показывает процент заряда.
+// * Кнопка над атакой — уклонение (рывок). Во время перезарядки показывает оставшиеся секунды.
 //
 // Координаты тут экранные (x — вправо, y — вверх); в мир их переводит MatchView.
 using System.Collections.Generic;
@@ -47,9 +50,17 @@ namespace UGame.Game
 
         readonly Stick move = new Stick();
         readonly Stick attack = new Stick();
+        readonly Stick super = new Stick();
         readonly List<TouchPoint> touches = new List<TouchPoint>(10);
-        FireKind pendingFire;
-        Vector2 pendingFireDir;
+        FireKind pendingFire, pendingSuper;
+        Vector2 pendingFireDir, pendingSuperDir;
+        bool pendingDodge;
+
+        // состояние способностей — выставляет MatchView каждый кадр, нужно для отрисовки
+        public bool SuperReady;
+        public float SuperCharge01;
+        public bool DodgeReady;
+        public float DodgeCooldownSec;
 
         public TouchControls()
         {
@@ -59,6 +70,13 @@ namespace UGame.Game
         }
 
         static float Radius => Mathf.Max(60f, Screen.height * 0.11f);
+
+        // раскладка правой стороны экрана (экранные пиксели, y вверх)
+        static Vector2 AttackHome { get { Rect s = UnityEngine.Device.Screen.safeArea; float r = Radius; return new Vector2(s.xMax - r * 1.6f, s.yMin + r * 1.6f); } }
+        static Vector2 SuperHome => AttackHome + new Vector2(-Radius * 2.5f, -Radius * 0.5f);
+        static Vector2 DodgeHome => AttackHome + new Vector2(0f, Radius * 2.4f);
+        static float SuperGrabRadius => Radius * 1.0f;
+        static float DodgeRadius => Radius * 0.6f;
 
         // ------------------------------------------------------------------ результат для MatchView
 
@@ -78,6 +96,11 @@ namespace UGame.Game
 
         public Vector2 AimDirection => Value(attack).normalized;
 
+        /// <summary>Игрок целится супером (показываем веер).</summary>
+        public bool SuperAiming => super.Held && super.MaxTravel >= TapMaxTravel && Value(super).magnitude >= AimCancelZone;
+
+        public Vector2 SuperDirection => Value(super).normalized;
+
         /// <summary>Забрать выстрел, если он был. Вызывается при отправке очередной команды.</summary>
         public FireKind ConsumeFire(out Vector2 direction)
         {
@@ -85,6 +108,23 @@ namespace UGame.Game
             direction = pendingFireDir;
             pendingFire = FireKind.None;
             return kind;
+        }
+
+        /// <summary>Забрать супер удар, если игрок его запросил.</summary>
+        public FireKind ConsumeSuper(out Vector2 direction)
+        {
+            var kind = pendingSuper;
+            direction = pendingSuperDir;
+            pendingSuper = FireKind.None;
+            return kind;
+        }
+
+        /// <summary>Забрать нажатие кнопки уклонения.</summary>
+        public bool ConsumeDodge()
+        {
+            bool d = pendingDodge;
+            pendingDodge = false;
+            return d;
         }
 
         static Vector2 Value(Stick s) => Vector2.ClampMagnitude((s.Current - s.Origin) / Radius, 1f);
@@ -99,15 +139,19 @@ namespace UGame.Game
                 if (t.Began)
                 {
                     if (t.Pos.x < Screen.width * 0.5f) { if (!move.Held) Grab(move, t); }
+                    else if ((t.Pos - DodgeHome).magnitude <= DodgeRadius) pendingDodge = true;
+                    else if (SuperReady && !super.Held && (t.Pos - SuperHome).magnitude <= SuperGrabRadius) Grab(super, t);
                     else if (!attack.Held) Grab(attack, t);
                 }
 
                 if (t.Id == move.FingerId) Drag(move, t);
                 else if (t.Id == attack.FingerId) Drag(attack, t);
+                else if (t.Id == super.FingerId) Drag(super, t);
 
                 if (t.Ended)
                 {
-                    if (t.Id == attack.FingerId) ReleaseAttack();
+                    if (t.Id == attack.FingerId) Release(attack, ref pendingFire, ref pendingFireDir);
+                    if (t.Id == super.FingerId) Release(super, ref pendingSuper, ref pendingSuperDir);
                     if (t.Id == move.FingerId) move.FingerId = -1;
                 }
             }
@@ -115,6 +159,7 @@ namespace UGame.Game
             // палец «потерялся» (сворачивание приложения и т. п.) — отпускаем джойстик без выстрела
             if (move.Held && !Contains(move.FingerId)) move.FingerId = -1;
             if (attack.Held && !Contains(attack.FingerId)) attack.FingerId = -1;
+            if (super.Held && !Contains(super.FingerId)) super.FingerId = -1;
         }
 
         static void Grab(Stick s, TouchPoint t)
@@ -130,16 +175,16 @@ namespace UGame.Game
             s.MaxTravel = Mathf.Max(s.MaxTravel, (s.Current - s.Origin).magnitude / Radius);
         }
 
-        void ReleaseAttack()
+        static void Release(Stick s, ref FireKind pending, ref Vector2 dir)
         {
-            Vector2 v = Value(attack);
-            if (attack.MaxTravel < TapMaxTravel) pendingFire = FireKind.Auto;
+            Vector2 v = Value(s);
+            if (s.MaxTravel < TapMaxTravel) pending = FireKind.Auto;
             else if (v.magnitude >= AimCancelZone)
             {
-                pendingFire = FireKind.Aimed;
-                pendingFireDir = v.normalized;
+                pending = FireKind.Aimed;
+                dir = v.normalized;
             }
-            attack.FingerId = -1;
+            s.FingerId = -1;
         }
 
         bool Contains(int id)
@@ -181,6 +226,7 @@ namespace UGame.Game
         // ------------------------------------------------------------------ отрисовка (IMGUI)
 
         static Texture2D disc, ring;
+        static GUIStyle badge;
 
         /// <summary>Рисует джойстики. Вызывается из OnGUI, guiScale — масштаб GUI.matrix.</summary>
         public void Draw(float guiScale)
@@ -194,15 +240,53 @@ namespace UGame.Game
             float r = Radius;
 
             Vector2 moveHome = new Vector2(safe.xMin + r * 1.6f, safe.yMin + r * 1.6f);
-            Vector2 attackHome = new Vector2(safe.xMax - r * 1.6f, safe.yMin + r * 1.6f);
 
             DrawStick(move, moveHome, new Color(1f, 1f, 1f, 0.35f), new Color(1f, 1f, 1f, 0.8f), guiScale);
-            DrawStick(attack, attackHome, new Color(1f, 0.35f, 0.3f, 0.35f), new Color(1f, 0.35f, 0.3f, 0.85f), guiScale);
+            DrawStick(attack, AttackHome, new Color(1f, 0.35f, 0.3f, 0.35f), new Color(1f, 0.35f, 0.3f, 0.85f), guiScale);
+
+            if (badge == null)
+                badge = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, fontSize = 15 };
+
+            // супер: заряжен — яркий жёлтый джойстик, нет — серый круг с процентом заряда
+            if (SuperReady)
+            {
+                DrawStick(super, SuperHome, new Color(1f, 0.85f, 0.1f, 0.6f), new Color(1f, 0.85f, 0.1f, 1f), guiScale, r * 0.8f);
+                if (!super.Held) Badge(SuperHome, r * 0.8f, "СУПЕР", Color.black, guiScale);
+            }
+            else
+            {
+                var prev = GUI.color;
+                GUI.color = new Color(0.5f, 0.5f, 0.5f, 0.45f);
+                GUI.DrawTexture(ToGui(SuperHome, r * 0.8f, guiScale), ring);
+                GUI.color = new Color(1f, 0.85f, 0.1f, 0.55f);
+                GUI.DrawTexture(ToGui(SuperHome, r * 0.8f * Mathf.Sqrt(SuperCharge01), guiScale), disc); // площадь ~ заряду
+                GUI.color = prev;
+                Badge(SuperHome, r * 0.8f, Mathf.FloorToInt(SuperCharge01 * 100f) + "%", Color.white, guiScale);
+            }
+
+            // уклонение: готово — голубая кнопка, иначе — серая с секундами до готовности
+            {
+                var prev = GUI.color;
+                GUI.color = DodgeReady ? new Color(0.35f, 0.85f, 1f, 0.85f) : new Color(0.4f, 0.4f, 0.4f, 0.6f);
+                GUI.DrawTexture(ToGui(DodgeHome, DodgeRadius, guiScale), disc);
+                GUI.color = prev;
+                Badge(DodgeHome, DodgeRadius, DodgeReady ? "РЫВОК" : DodgeCooldownSec.ToString("0.0"),
+                    DodgeReady ? Color.black : Color.white, guiScale);
+            }
         }
 
-        static void DrawStick(Stick s, Vector2 home, Color baseColor, Color knobColor, float guiScale)
+        static void Badge(Vector2 center, float radius, string text, Color color, float guiScale)
         {
-            float r = Radius;
+            var prev = GUI.contentColor;
+            GUI.contentColor = color;
+            badge.fontSize = Mathf.RoundToInt(Mathf.Clamp(radius / guiScale * 0.38f, 11f, 22f));
+            GUI.Label(ToGui(center, radius, guiScale), text, badge);
+            GUI.contentColor = prev;
+        }
+
+        static void DrawStick(Stick s, Vector2 home, Color baseColor, Color knobColor, float guiScale, float drawRadius = 0f)
+        {
+            float r = drawRadius > 0f ? drawRadius : Radius;
             Vector2 origin = s.Held ? s.Origin : home;
             Vector2 knob = s.Held ? origin + Value(s) * r : origin;
             float alpha = s.Held ? 1f : 0.6f;

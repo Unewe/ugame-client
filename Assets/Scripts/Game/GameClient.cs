@@ -49,6 +49,12 @@ namespace UGame.Game
         float connectStartedAt;
         bool joined;
 
+        // счётчик FPS: среднее за полсекунды, чтобы цифра не прыгала каждый кадр
+        const float FpsWindowSec = 0.5f;
+        float fpsAccTime, fps;
+        int fpsAccFrames;
+        GUIStyle statsStyle;
+
         void Awake()
         {
             Application.runInBackground = true; // второй клиент в фоне не должен «замерзать»
@@ -72,6 +78,15 @@ namespace UGame.Game
 
         void Update()
         {
+            fpsAccTime += Time.unscaledDeltaTime;
+            fpsAccFrames++;
+            if (fpsAccTime >= FpsWindowSec)
+            {
+                fps = fpsAccFrames / fpsAccTime;
+                fpsAccTime = 0f;
+                fpsAccFrames = 0;
+            }
+
             conn?.Tick();               // приём пакетов → события
             if (match != null) match.Tick(Time.deltaTime);
 
@@ -320,6 +335,43 @@ namespace UGame.Game
                 case Page.Match: DrawMatchHud(); break;
                 case Page.Result: DrawMatchHud(); DrawResult(); break;
             }
+            DrawStats();
+        }
+
+        /// <summary>FPS и ping в правом верхнем углу (с учётом выреза камеры на телефоне).</summary>
+        void DrawStats()
+        {
+            if (statsStyle == null)
+                statsStyle = new GUIStyle(GUI.skin.label) { fontSize = 14, fontStyle = FontStyle.Bold, alignment = TextAnchor.UpperRight };
+
+            Rect safe = UnityEngine.Device.Screen.safeArea;
+            float right = safe.xMax / scale - 10f;
+            float top = (Screen.height - safe.yMax) / scale + 6f;
+            const float w = 120f, h = 20f;
+
+            Color fpsColor = fps >= 50f ? new Color(0.5f, 1f, 0.5f) : fps >= 30f ? new Color(1f, 0.9f, 0.3f) : new Color(1f, 0.45f, 0.4f);
+            Label(new Rect(right - w, top, w, h), $"FPS {Mathf.RoundToInt(fps)}", fpsColor);
+
+            if (conn != null && (screen == Page.Connecting || screen == Page.Match || screen == Page.Result))
+            {
+                int ping = conn.PingMs;
+                Color pingColor = ping < 0 ? Color.white
+                    : ping <= 80 ? new Color(0.5f, 1f, 0.5f)
+                    : ping <= 150 ? new Color(1f, 0.9f, 0.3f)
+                    : new Color(1f, 0.45f, 0.4f);
+                Label(new Rect(right - w, top + h, w, h), ping < 0 ? "Ping —" : $"Ping {ping} мс", pingColor);
+            }
+        }
+
+        /// <summary>Текст с тенью — читается и на светлой траве, и на тёмных панелях.</summary>
+        void Label(Rect r, string text, Color color)
+        {
+            var prev = GUI.contentColor;
+            GUI.contentColor = new Color(0f, 0f, 0f, 0.8f);
+            GUI.Label(new Rect(r.x + 1, r.y + 1, r.width, r.height), text, statsStyle);
+            GUI.contentColor = color;
+            GUI.Label(r, text, statsStyle);
+            GUI.contentColor = prev;
         }
 
         void BeginPanel(float width, float height)
@@ -387,8 +439,8 @@ namespace UGame.Game
             if (!string.IsNullOrEmpty(error)) GUILayout.Label(error, errorStyle);
             GUILayout.FlexibleSpace();
             GUILayout.Label(TouchControls.Available
-                ? "Управление: левый джойстик — движение; правый — тяните, чтобы прицелиться, отпустите — выстрел; короткое касание — автоприцел"
-                : "Управление: WASD — движение, мышь — прицел, ЛКМ или пробел — выстрел", small);
+                ? "Управление: левый джойстик — движение; правый — тяните, чтобы прицелиться, отпустите — выстрел; короткое касание — автоприцел. Жёлтый джойстик — супер, кнопка сверху — рывок"
+                : "Управление: WASD — движение, мышь — прицел, ЛКМ или пробел — выстрел, E или ПКМ — супер, Shift — рывок", small);
             GUILayout.EndArea();
         }
 

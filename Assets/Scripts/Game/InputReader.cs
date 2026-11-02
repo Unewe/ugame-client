@@ -44,6 +44,28 @@ namespace UGame.Game
 #endif
         }
 
+        /// <summary>Супер удар: E или правая кнопка мыши (срабатывает на нажатие).</summary>
+        public static bool SuperPressed(bool includeMouse)
+        {
+#if ENABLE_INPUT_SYSTEM
+            return (includeMouse && Mouse.current != null && Mouse.current.rightButton.wasPressedThisFrame)
+                   || (Keyboard.current != null && Keyboard.current.eKey.wasPressedThisFrame);
+#else
+            return (includeMouse && Input.GetMouseButtonDown(1)) || Input.GetKeyDown(KeyCode.E);
+#endif
+        }
+
+        /// <summary>Уклонение: Shift (срабатывает на нажатие).</summary>
+        public static bool DodgePressed()
+        {
+#if ENABLE_INPUT_SYSTEM
+            var k = Keyboard.current;
+            return k != null && (k.leftShiftKey.wasPressedThisFrame || k.rightShiftKey.wasPressedThisFrame);
+#else
+            return Input.GetKeyDown(KeyCode.LeftShift) || Input.GetKeyDown(KeyCode.RightShift);
+#endif
+        }
+
         public static Vector2 MousePosition()
         {
 #if ENABLE_INPUT_SYSTEM
