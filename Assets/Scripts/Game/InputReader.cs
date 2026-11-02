@@ -29,14 +29,40 @@ namespace UGame.Game
             return Vector2.ClampMagnitude(v, 1f);
         }
 
-        /// <summary>Атака: левая кнопка мыши или пробел (удержание — стрельба очередью).</summary>
-        public static bool Attack()
+        /// <summary>
+        /// Атака: левая кнопка мыши или пробел (удержание — стрельба очередью).
+        /// При сенсорном управлении мышь не учитываем: на телефоне и в Device Simulator
+        /// касание экрана тоже выглядит как нажатие мыши.
+        /// </summary>
+        public static bool Attack(bool includeMouse)
         {
 #if ENABLE_INPUT_SYSTEM
-            return (Mouse.current != null && Mouse.current.leftButton.isPressed)
+            return (includeMouse && Mouse.current != null && Mouse.current.leftButton.isPressed)
                    || (Keyboard.current != null && Keyboard.current.spaceKey.isPressed);
 #else
-            return Input.GetMouseButton(0) || Input.GetKey(KeyCode.Space);
+            return (includeMouse && Input.GetMouseButton(0)) || Input.GetKey(KeyCode.Space);
+#endif
+        }
+
+        /// <summary>Супер удар: E или правая кнопка мыши (срабатывает на нажатие).</summary>
+        public static bool SuperPressed(bool includeMouse)
+        {
+#if ENABLE_INPUT_SYSTEM
+            return (includeMouse && Mouse.current != null && Mouse.current.rightButton.wasPressedThisFrame)
+                   || (Keyboard.current != null && Keyboard.current.eKey.wasPressedThisFrame);
+#else
+            return (includeMouse && Input.GetMouseButtonDown(1)) || Input.GetKeyDown(KeyCode.E);
+#endif
+        }
+
+        /// <summary>Уклонение: Shift (срабатывает на нажатие).</summary>
+        public static bool DodgePressed()
+        {
+#if ENABLE_INPUT_SYSTEM
+            var k = Keyboard.current;
+            return k != null && (k.leftShiftKey.wasPressedThisFrame || k.rightShiftKey.wasPressedThisFrame);
+#else
+            return Input.GetKeyDown(KeyCode.LeftShift) || Input.GetKeyDown(KeyCode.RightShift);
 #endif
         }
 

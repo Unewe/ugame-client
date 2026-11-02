@@ -18,6 +18,17 @@ namespace UGame.EditorTools
                 Debug.Log("[UGame] Разрешены HTTP-запросы (Player Settings → Allow downloads over HTTP)");
             }
 
+            // Мобильные сборки — только альбомная ориентация (джойстики рассчитаны на неё)
+            if (PlayerSettings.allowedAutorotateToPortrait || PlayerSettings.allowedAutorotateToPortraitUpsideDown)
+            {
+                PlayerSettings.defaultInterfaceOrientation = UIOrientation.AutoRotation;
+                PlayerSettings.allowedAutorotateToPortrait = false;
+                PlayerSettings.allowedAutorotateToPortraitUpsideDown = false;
+                PlayerSettings.allowedAutorotateToLandscapeLeft = true;
+                PlayerSettings.allowedAutorotateToLandscapeRight = true;
+                Debug.Log("[UGame] Ориентация для телефонов: только альбомная");
+            }
+
             // Чтобы клиент в неактивном окне продолжал играть (удобно для теста двумя клиентами)
             if (!PlayerSettings.runInBackground)
             {

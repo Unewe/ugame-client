@@ -53,6 +53,12 @@ namespace UGame.Net
 
         public bool IsConnected => client.connected;
 
+        /// <summary>
+        /// Время приёма-ответа до сервера, мс; -1 — ещё не измерено. kcp2k шлёт Ping раз в секунду,
+        /// сервер возвращает его время в Pong (KcpConnection.java).
+        /// </summary>
+        public int PingMs => client.connected && client.rttInMilliseconds > 0 ? (int)client.rttInMilliseconds : -1;
+
         public void Connect(string host, int port, string matchTicket)
         {
             ticket = matchTicket;
