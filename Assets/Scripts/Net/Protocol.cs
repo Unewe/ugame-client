@@ -141,7 +141,8 @@ namespace UGame.Net
         public EntityKind Kind;
         public Vector2 Pos;   // метры, координаты арены
         public float Aim;     // радианы
-        public float Hp01;    // 0..1, 0 — мёртв
+        public float Hp01;    // 0..1, 0 — мёртв (только у бойцов)
+        public byte Owner;    // снаряд: id бойца, который его выпустил
         public byte Team;
         public EntityFlags Flags;
     }
@@ -158,6 +159,8 @@ namespace UGame.Net
         public ushort DodgeCooldownTicks; // 0 — уклонение готово
         public byte DashTicksLeft;        // > 0 — идёт рывок
         public ushort DashAngle;          // направление рывка, 0..65535
+        public ushort LastAttackSeq;      // seq последней команды, чья атака реально вылетела
+        public ushort LastSuperSeq;       // то же для супера
 
         public bool SuperReady => SuperCharge >= 255;
         public readonly List<EntityState> Entities = new List<EntityState>();
@@ -176,20 +179,25 @@ namespace UGame.Net
                 DodgeCooldownTicks = (ushort)r.U16(),
                 DashTicksLeft = (byte)r.U8(),
                 DashAngle = (ushort)r.U16(),
+                LastAttackSeq = (ushort)r.U16(),
+                LastSuperSeq = (ushort)r.U16(),
             };
             int count = r.U8();
             for (int i = 0; i < count; i++)
             {
-                s.Entities.Add(new EntityState
+                var e = new EntityState
                 {
                     Id = (ushort)r.U16(),
                     Kind = (EntityKind)r.U8(),
                     Pos = new Vector2(Quantize.I16ToPos(r.I16()), Quantize.I16ToPos(r.I16())),
                     Aim = Quantize.U16ToAngle(r.U16()),
-                    Hp01 = r.U8() / 255f,
-                    Team = (byte)r.U8(),
-                    Flags = (EntityFlags)r.U8(),
-                });
+                };
+                int hpOrOwner = r.U8(); // у снаряда в этом байте — id владельца
+                if (e.Kind == EntityKind.Projectile) e.Owner = (byte)hpOrOwner;
+                else e.Hp01 = hpOrOwner / 255f;
+                e.Team = (byte)r.U8();
+                e.Flags = (EntityFlags)r.U8();
+                s.Entities.Add(e);
             }
             return s;
         }

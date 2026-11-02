@@ -4,6 +4,11 @@
 // * Свой боец — client-side prediction: двигаем его сразу, а по снапшоту берём позицию сервера
 //   и заново применяем ещё не подтверждённые команды (reconciliation). Расхождение сглаживается.
 // * Чужие бойцы и снаряды — интерполяция между снапшотами с задержкой ~100 мс.
+// * Свои выстрелы тоже предсказываются: снаряд появляется сразу при нажатии, а серверная копия
+//   (у снаряда в снапшоте есть id владельца) не рисуется. Сервер проверяет попадания по позициям
+//   целей, отмотанным на RTT стрелка + InterpDelayTicks (компенсация лагов в World.java), поэтому
+//   то, что игрок видит у себя, совпадает с тем, что посчитает сервер. Выстрел, которого сервер
+//   не сделал (LastAttackSeq/LastSuperSeq в снапшоте), убирается.
 // * Рывок (уклонение) тоже предсказывается: сервер присылает своему игроку кулдаун и остаток
 //   рывка, клиент повторяет неподтверждённые команды той же логикой, что World.moveBrawler.
 //
@@ -26,8 +31,15 @@ namespace UGame.Game
         const float DashDistance = 4f;
         const float SuperRange = 9f;
         const float SuperSpreadDeg = 40f;
+        const float SuperSpeed = 18f;
+        const float SuperRadius = 0.3f;
+        const int SuperShots = 5;
+        const float ProjectileSpeed = 15f;
+        const float ProjectileRadius = 0.15f;
+        const float AttackCooldownSec = 0.5f;
 
-        const float InterpDelayTicks = 3f;   // 100 мс при 30 Гц
+        // 100 мс при 30 Гц; должно совпадать с lagcomp.interp-delay-ticks в game-server.properties
+        const float InterpDelayTicks = 3f;
         const int MaxSnapshots = 40;
         const int MaxPending = 120;
 
@@ -61,7 +73,7 @@ namespace UGame.Game
         int myTeam;
         int tickRate;
         float tickDt;
-        int dashTicks, dodgeCooldownTicks;
+        int dashTicks, dodgeCooldownTicks, attackCooldownTicks;
         float dashStep;
 
         public bool Running { get; private set; }
@@ -106,6 +118,19 @@ namespace UGame.Game
         public float DodgeCooldownLeftSec => dash.Cooldown * tickDt;
         public bool Dashing => dash.DashLeft > 0;
 
+        // предсказанные свои выстрелы
+        sealed class PredictedShot
+        {
+            public ushort Seq;        // команда, в которой нажали атаку/супер
+            public bool IsSuper;
+            public bool Confirmed;    // сервер подтвердил, что выстрел был
+            public Vector2 Origin, Dir;
+            public float Age;         // секунд с выстрела
+            public Transform Body;    // null — снаряд уже попал или долетел
+        }
+        readonly List<PredictedShot> shots = new List<PredictedShot>();
+        int lastShotSeq = -1;         // seq последней атаки — кулдаун считается в командах, как на сервере
+
         // объекты сцены
         sealed class View
         {
@@ -117,6 +142,7 @@ namespace UGame.Game
             public byte Team;
             public ushort Id;
             public Transform Body, Gun, Ring, SuperGlow;
+            public bool Dodging;
         }
         readonly Dictionary<ushort, View> views = new Dictionary<ushort, View>();
         readonly List<ushort> toRemove = new List<ushort>();
@@ -128,8 +154,6 @@ namespace UGame.Game
         readonly Transform[] aimLines = new Transform[3]; // центр + края веера супера
         const float ProjectileRange = 8f;   // как PROJECTILE_RANGE в World.java
         const float AutoAimRange = 10f;
-        const float AttackCooldown = 0.5f;  // как ATTACK_COOLDOWN_SEC в World.java
-        float fireReadyAt;
         bool queuedFire;
         float queuedAim;
         public bool TouchMode => touch != null;
@@ -148,6 +172,7 @@ namespace UGame.Game
             // Math.round из Java: округление половины вверх
             view.dashTicks = Mathf.Max(1, Mathf.FloorToInt(DashDurationSec * view.tickRate + 0.5f));
             view.dodgeCooldownTicks = Mathf.FloorToInt(DodgeCooldownSec * view.tickRate + 0.5f);
+            view.attackCooldownTicks = Mathf.Max(1, Mathf.FloorToInt(AttackCooldownSec * view.tickRate + 0.5f));
             view.dashStep = DashDistance / view.dashTicks;
             view.BuildArena();
             view.SetupCamera();
@@ -194,6 +219,7 @@ namespace UGame.Game
 
         void Reconcile(Snapshot s)
         {
+            ResolveShots(s);
             EntityState? own = FindOwn(s);
             if (own == null || own.Value.Hp01 <= 0f)
             {
@@ -239,6 +265,31 @@ namespace UGame.Game
             }
             predicted = pos;
             predicting = true;
+        }
+
+        /// <summary>
+        /// Сверка предсказанных выстрелов: когда сервер применил команду выстрела (ack), он уже решил,
+        /// вылетел ли снаряд. Если LastAttackSeq/LastSuperSeq до неё не дошёл — выстрела не было
+        /// (умер раньше, супер не был заряжен, команда потерялась), и снаряд-«призрак» убираем.
+        /// </summary>
+        void ResolveShots(Snapshot s)
+        {
+            for (int i = shots.Count - 1; i >= 0; i--)
+            {
+                var shot = shots[i];
+                if (shot.Confirmed || Quantize.SeqGreater(shot.Seq, s.AckInputSeq)) continue;
+                ushort fired = shot.IsSuper ? s.LastSuperSeq : s.LastAttackSeq;
+                if (!Quantize.SeqGreater(shot.Seq, fired))
+                {
+                    shot.Confirmed = true;
+                    if (shot.Body == null) shots.RemoveAt(i);
+                }
+                else
+                {
+                    if (shot.Body != null) Destroy(shot.Body.gameObject);
+                    shots.RemoveAt(i);
+                }
+            }
         }
 
         EntityState? FindOwn(Snapshot s)
@@ -302,6 +353,7 @@ namespace UGame.Game
             AdvanceClock(dt);
             smoothOffset = Vector2.Lerp(smoothOffset, Vector2.zero, 1f - Mathf.Exp(-12f * dt));
             UpdateViews();
+            UpdateShots(dt);
             UpdateAimLine();
             UpdateCamera(dt);
         }
@@ -325,6 +377,9 @@ namespace UGame.Game
             if (touch != null && touch.Move.sqrMagnitude > move.sqrMagnitude) move = touch.Move;
             move = ScreenToWorldDir(move);
 
+            // кулдаун атаки — в командах, ровно как World.attackReady: тогда предсказанный выстрел
+            // сервер тоже сделает, а «лишних» нажатий на кулдауне мы просто не отправляем
+            bool attackReady = lastShotSeq < 0 || ((nextSeq - lastShotSeq) & 0xFFFF) >= attackCooldownTicks;
             bool fire;
             bool super = false;
             if (touch != null)
@@ -332,12 +387,12 @@ namespace UGame.Game
                 // супер и обычный выстрел в одной команде не шлём: у них разный прицел,
                 // а выстрел из очереди спокойно уйдёт следующей командой
                 super = TouchSuper();
-                fire = !super && (TouchFire(move) | InputReader.Attack(includeMouse: false));
+                fire = !super && (TouchFire(move, attackReady) | (attackReady && InputReader.Attack(includeMouse: false)));
             }
             else
             {
                 UpdateAim();
-                fire = InputReader.Attack(includeMouse: true);
+                fire = attackReady && InputReader.Attack(includeMouse: true);
             }
             if (superQueued && SuperReady) super = true;
             superQueued = false;
@@ -363,6 +418,7 @@ namespace UGame.Game
                 Buttons = buttons,
             };
             if (nextSeq == 0) nextSeq = 1;
+            if (fire) lastShotSeq = cmd.Seq;
             if (super)
             {
                 superInFlight = true;
@@ -381,6 +437,15 @@ namespace UGame.Game
                 predicted = Step(predicted, ref dash, mx, my, aim, dodge);
                 pending.Add(new Pending { Seq = cmd.Seq, Mx = mx, My = my, Aim = aim, Dodge = dodge });
                 if (pending.Count > MaxPending) pending.RemoveAt(0);
+
+                // выстрелы — с позиции после этого шага, как в World.step (сначала движение, потом стрельба)
+                if (fire) SpawnShot(cmd.Seq, false, aim);
+                if (super)
+                    for (int i = 0; i < SuperShots; i++)
+                    {
+                        float t = SuperShots == 1 ? 0f : (float)i / (SuperShots - 1) - 0.5f;
+                        SpawnShot(cmd.Seq, true, aim + t * SuperSpreadDeg * Mathf.Deg2Rad);
+                    }
             }
         }
 
@@ -391,17 +456,16 @@ namespace UGame.Game
         /// Выстрел с телефона — разовое нажатие. Если оно пришлось на перезарядку, сервер бы его
         /// проигнорировал, поэтому выстрел ждёт конца перезарядки и уходит с тем же прицелом.
         /// </summary>
-        bool TouchFire(Vector2 worldMove)
+        bool TouchFire(Vector2 worldMove, bool attackReady)
         {
             if (TouchAim(worldMove))
             {
                 queuedFire = true;
                 queuedAim = myAim;
             }
-            if (!queuedFire || Time.time < fireReadyAt) return false;
+            if (!queuedFire || !attackReady) return false;
             queuedFire = false;
             myAim = queuedAim;
-            fireReadyAt = Time.time + AttackCooldown + 0.05f;
             return true;
         }
 
@@ -546,6 +610,8 @@ namespace UGame.Game
 
             foreach (var e in to.Entities)
             {
+                // свои снаряды рисуем по предсказанию (UpdateShots), серверную копию — нет
+                if (e.Kind == EntityKind.Projectile && e.Owner == myEntityId) continue;
                 bool isOwn = e.Id == myEntityId && e.Kind == EntityKind.Brawler;
                 Vector2 pos;
                 float aim;
@@ -612,6 +678,7 @@ namespace UGame.Game
         {
             bool dodging = (flags & EntityFlags.Dodging) != 0;
             bool superReady = (flags & EntityFlags.SuperReady) != 0;
+            v.Dodging = dodging;
             if (v.Body != null)
             {
                 v.Body.localScale = dodging ? new Vector3(1.15f, 0.45f, 1.15f) : new Vector3(1f, 0.8f, 1f);
@@ -621,6 +688,72 @@ namespace UGame.Game
             if (v.Ring != null)
                 v.Ring.GetComponent<Renderer>().material.color = dodging ? DodgeRingColor : v.Team == myTeam ? AllyColor : EnemyColor;
             if (v.SuperGlow != null && v.SuperGlow.gameObject.activeSelf != superReady) v.SuperGlow.gameObject.SetActive(superReady);
+        }
+
+        // ------------------------------------------------------------------ свои выстрелы
+
+        void SpawnShot(ushort seq, bool isSuper, float angle)
+        {
+            var dir = new Vector2(Mathf.Cos(angle), Mathf.Sin(angle));
+            float radius = isSuper ? SuperRadius : ProjectileRadius;
+            var body = Primitive(PrimitiveType.Sphere, transform, isSuper ? SuperShotColor : AllyShotColor);
+            body.localScale = Vector3.one * (isSuper ? 0.65f : 0.35f);
+            body.GetComponent<Renderer>().shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            var shot = new PredictedShot
+            {
+                Seq = seq,
+                IsSuper = isSuper,
+                Origin = predicted + dir * (BrawlerRadius + radius), // как World.spawnProjectile
+                Dir = dir,
+                Body = body,
+            };
+            body.position = new Vector3(shot.Origin.x, 0.7f, shot.Origin.y);
+            shots.Add(shot);
+        }
+
+        /// <summary>
+        /// Полёт предсказанных снарядов. Попадание здесь только косметическое (снаряд исчезает),
+        /// урон считает сервер — по тем же позициям врагов, что видны на экране.
+        /// </summary>
+        void UpdateShots(float dt)
+        {
+            for (int i = shots.Count - 1; i >= 0; i--)
+            {
+                var s = shots[i];
+                if (s.Body == null) continue; // ждёт подтверждения в ResolveShots
+                s.Age += dt;
+                float speed = s.IsSuper ? SuperSpeed : ProjectileSpeed;
+                float range = s.IsSuper ? SuperRange : ProjectileRange;
+                float hitDist = BrawlerRadius + (s.IsSuper ? SuperRadius : ProjectileRadius);
+                float traveled = speed * s.Age;
+                Vector2 p = s.Origin + s.Dir * traveled;
+                bool done = traveled > range || p.x < 0 || p.y < 0 || p.x > ArenaWidth || p.y > ArenaHeight
+                            || HitsVisibleEnemy(p, hitDist);
+                if (done)
+                {
+                    Destroy(s.Body.gameObject);
+                    s.Body = null;
+                    if (s.Confirmed) shots.RemoveAt(i);
+                    continue;
+                }
+                s.Body.position = new Vector3(p.x, 0.7f, p.y);
+            }
+            if (shots.Count > 64) // подтверждения не приходят (связь пропала) — не копим бесконечно
+            {
+                if (shots[0].Body != null) Destroy(shots[0].Body.gameObject);
+                shots.RemoveAt(0);
+            }
+        }
+
+        bool HitsVisibleEnemy(Vector2 p, float hitDist)
+        {
+            foreach (var v in views.Values)
+            {
+                if (v.Kind != EntityKind.Brawler || v.Team == myTeam || v.Dodging || !v.Root.activeSelf) continue;
+                float dx = v.WorldPos.x - p.x, dy = v.WorldPos.z - p.y;
+                if (dx * dx + dy * dy <= hitDist * hitDist) return true;
+            }
+            return false;
         }
 
         View CreateView(EntityState e)
