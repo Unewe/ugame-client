@@ -105,6 +105,10 @@ namespace UGame.Net
         public sbyte MoveX, MoveY;   // уже квантованные оси [-127..127] — их же использует предсказание
         public ushort Aim;           // 0..65535 = 0..2π
         public Buttons Buttons;
+        // Тик, в котором клиент показывал чужих в момент команды (младшие 16 бит + дробь /256).
+        // По нему сервер проверяет выстрел ровно по тем позициям врагов, что были на экране.
+        public ushort ViewTick;
+        public byte ViewFrac;
     }
 
     public static class InputPacket
@@ -119,7 +123,8 @@ namespace UGame.Net
             for (int i = 0; i < count; i++)
             {
                 var c = newestFirst[i];
-                w.U16(c.Seq).I8(c.MoveX).I8(c.MoveY).U16(c.Aim).U8((byte)c.Buttons);
+                w.U16(c.Seq).I8(c.MoveX).I8(c.MoveY).U16(c.Aim).U8((byte)c.Buttons)
+                 .U16(c.ViewTick).U8(c.ViewFrac);
             }
         }
     }

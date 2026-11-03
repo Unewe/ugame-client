@@ -39,6 +39,17 @@ namespace UGame.Game
         const float ProjectileSpeed = 15f;
         const float ProjectileRadius = 0.15f;
         const float AttackCooldownSec = 0.5f;
+        const float BrawlerMaxHp = 3000f;          // как BRAWLER_MAX_HP в World.java — для цифр урона
+        const float HitFlashSec = 0.12f;
+        const float GhostHoldSec = 0.25f;          // «призрачный» кусок полоски сначала стоит на месте…
+        const float GhostDrainPerSec = 1.2f;       // …потом стекает (доля полоски в секунду)
+        const float DamageNumberSec = 0.8f;
+        const float DamageNumberMergeSec = 0.15f;  // урон, пришедший почти сразу (веер супера), — одной цифрой
+        const float PredictedFlashSec = 0.6f;      // после своей вспышки урон с сервера второй раз не мигает
+        static readonly Color HitFlashColor = Color.white;
+        static readonly Color GhostBarColor = new Color(1f, 1f, 1f, 0.85f);
+        static readonly Color DamageToEnemyColor = Color.white;
+        static readonly Color DamageToUsColor = new Color(1f, 0.35f, 0.3f);
 
         // 100 мс при 30 Гц; должно совпадать с lagcomp.interp-delay-ticks в game-server.properties
         const float InterpDelayTicks = 3f;
@@ -147,7 +158,29 @@ namespace UGame.Game
             public ushort Id;
             public Transform Body, Gun, Ring, SuperGlow;
             public bool Dodging;
+            public Color BodyColor;
+            public float FlashUntil;      // Time.time, до которого тело подсвечено попаданием
+            public bool Flashing;
+            public float ServerHp01 = -1f;        // здоровье из последнего снапшота; -1 — ещё не видели
+            public float GhostHp01;               // до куда тянется белый «призрачный» кусок полоски
+            public float GhostHoldUntil;          // Time.time, до которого он не стекает
+            public float LastPredictedHit = -10f; // Time.time попадания своего снаряда на экране
         }
+
+        /// <summary>Всплывающая цифра урона над бойцом.</summary>
+        sealed class DamageNumber
+        {
+            public ushort Id;
+            public float Raw;         // урон в единицах здоровья (из снапшота, до округления)
+            public float Born;        // Time.time
+            public Vector3 WorldPos;  // где показать, если бойца уже не видно (умер)
+            public bool ToUs;         // урон по нам или союзнику — красная
+        }
+        readonly List<DamageNumber> damageNumbers = new List<DamageNumber>();
+        GUIStyle damageStyle;
+
+        // здоровье бойцов из ПОСЛЕДНЕГО снапшота (без задержки интерполяции)
+        readonly Dictionary<ushort, float> latestHp = new Dictionary<ushort, float>();
         readonly Dictionary<ushort, View> views = new Dictionary<ushort, View>();
         readonly List<ushort> toRemove = new List<ushort>();
         Camera cam;
@@ -213,6 +246,9 @@ namespace UGame.Game
             if (buffer.Count > MaxSnapshots) buffer.RemoveAt(0);
             Latest = s;
             latestArrival = Time.timeAsDouble;
+            latestHp.Clear();
+            foreach (var e in s.Entities)
+                if (e.Kind == EntityKind.Brawler) latestHp[e.Id] = e.Hp01;
 
             if (!clockStarted)
             {
@@ -418,6 +454,9 @@ namespace UGame.Game
             if (super) buttons |= Buttons.Super;
             if (dodge) buttons |= Buttons.Dodge;
 
+            // что игрок видел на экране, нажимая кнопку (renderTick этого кадра ещё не сдвинут)
+            double view = clockStarted ? System.Math.Max(0.0, renderTick) : 0.0;
+            long viewWhole = (long)System.Math.Floor(view);
             var cmd = new InputCommand
             {
                 Seq = nextSeq++,
@@ -425,6 +464,8 @@ namespace UGame.Game
                 MoveY = (sbyte)qy,
                 Aim = (ushort)Quantize.AngleToU16(myAim),
                 Buttons = buttons,
+                ViewTick = (ushort)(viewWhole & 0xFFFF),
+                ViewFrac = (byte)Mathf.Clamp((int)((view - viewWhole) * 256.0), 0, 255),
             };
             if (nextSeq == 0) nextSeq = 1;
             if (fire)
@@ -651,11 +692,14 @@ namespace UGame.Game
                     pos = e.Pos;
                     aim = e.Aim;
                 }
+                // Жив ли боец — по интерполированному снапшоту (в такт его позиции), а полоска
+                // здоровья — по последнему, как у своего: иначе урон по врагам виден на 100 мс позже.
+                bool aliveInView = hp > 0f;
+                if (e.Kind == EntityKind.Brawler && latestHp.TryGetValue(e.Id, out float latest)) hp = latest;
                 var flags = e.Flags;
                 if (isOwn)
                 {
                     var latestOwn = FindOwn(Latest);
-                    hp = latestOwn?.Hp01 ?? hp; // своё здоровье — без задержки
                     if (latestOwn != null) flags = latestOwn.Value.Flags;
                     if (predicting) // рывок своего бойца — по предсказанию, а не с опозданием на RTT
                         flags = Dashing ? flags | EntityFlags.Dodging : flags & ~EntityFlags.Dodging;
@@ -667,16 +711,20 @@ namespace UGame.Game
                     views[e.Id] = view;
                 }
                 view.Seen = true;
-                view.Hp01 = hp;
+                view.Hp01 = e.Kind == EntityKind.Brawler ? ApplyServerHp(view, hp) : hp;
                 view.Team = e.Team;
 
-                bool visible = e.Kind != EntityKind.Brawler || hp > 0f;
+                bool visible = e.Kind != EntityKind.Brawler || aliveInView;
                 if (view.Root.activeSelf != visible) view.Root.SetActive(visible);
 
                 view.WorldPos = new Vector3(pos.x, 0f, pos.y);
                 view.Root.transform.position = view.WorldPos;
                 view.Root.transform.rotation = Quaternion.LookRotation(new Vector3(Mathf.Cos(aim), 0f, Mathf.Sin(aim)));
-                if (e.Kind == EntityKind.Brawler) ApplyBrawlerFlags(view, flags);
+                if (e.Kind == EntityKind.Brawler)
+                {
+                    ApplyBrawlerFlags(view, flags);
+                    UpdateHitFlash(view);
+                }
             }
 
             toRemove.Clear();
@@ -740,14 +788,17 @@ namespace UGame.Game
             {
                 var s = shots[i];
                 if (s.Body == null) continue; // ждёт подтверждения в ResolveShots
-                s.Age += dt;
                 float speed = s.IsSuper ? SuperSpeed : ProjectileSpeed;
                 float range = s.IsSuper ? SuperRange : ProjectileRange;
                 float hitDist = BrawlerRadius + (s.IsSuper ? SuperRadius : ProjectileRadius);
+                // отрезок полёта за кадр (обрезанный по дальности) — как World.stepProjectiles на сервере
+                Vector2 prev = s.Origin + s.Dir * Mathf.Min(speed * s.Age, range);
+                s.Age += dt;
                 float traveled = speed * s.Age;
                 Vector2 p = s.Origin + s.Dir * traveled;
-                bool done = traveled > range || p.x < 0 || p.y < 0 || p.x > ArenaWidth || p.y > ArenaHeight
-                            || HitsVisibleEnemy(p, hitDist);
+                Vector2 hitEnd = s.Origin + s.Dir * Mathf.Min(traveled, range);
+                bool done = HitVisibleEnemy(prev, hitEnd, hitDist)
+                            || traveled >= range || p.x < 0 || p.y < 0 || p.x > ArenaWidth || p.y > ArenaHeight;
                 if (done)
                 {
                     Destroy(s.Body.gameObject);
@@ -764,15 +815,104 @@ namespace UGame.Game
             }
         }
 
-        bool HitsVisibleEnemy(Vector2 p, float hitDist)
+        /// <summary>
+        /// Попал ли предсказанный снаряд во врага на экране. Если да — снаряд исчезает и враг сразу
+        /// вспыхивает. Здоровье при этом НЕ трогаем: его показываем только по серверу (ApplyServerHp),
+        /// он подтвердит попадание примерно через пинг — тогда появится цифра урона и стечёт полоска.
+        /// </summary>
+        bool HitVisibleEnemy(Vector2 a, Vector2 b, float hitDist)
         {
             foreach (var v in views.Values)
             {
                 if (v.Kind != EntityKind.Brawler || v.Team == myTeam || v.Dodging || !v.Root.activeSelf) continue;
-                float dx = v.WorldPos.x - p.x, dy = v.WorldPos.z - p.y;
-                if (dx * dx + dy * dy <= hitDist * hitDist) return true;
+                if (SegmentDistSq(a, b, new Vector2(v.WorldPos.x, v.WorldPos.z)) > hitDist * hitDist) continue;
+                v.LastPredictedHit = Time.time;
+                Flash(v);
+                return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// Здоровье с сервера — единственный источник для полоски. Чтобы урон «читался», хотя приходит
+        /// через пинг: отнятый кусок остаётся белым и через GhostHoldSec стекает, над бойцом всплывает
+        /// цифра урона, а если наш снаряд только что не мигнул по этому бойцу — он вспыхивает.
+        /// Вызывается каждый кадр; возвращает здоровье для полоски.
+        /// </summary>
+        float ApplyServerHp(View v, float serverHp)
+        {
+            float now = Time.time;
+            if (v.ServerHp01 < 0f)
+            {
+                v.ServerHp01 = v.GhostHp01 = serverHp; // первое появление
+                return serverHp;
+            }
+            if (serverHp < v.ServerHp01 - 0.001f)
+            {
+                v.GhostHp01 = Mathf.Max(v.GhostHp01, v.ServerHp01);
+                v.GhostHoldUntil = now + GhostHoldSec;
+                AddDamageNumber(v, (v.ServerHp01 - serverHp) * BrawlerMaxHp);
+                if (now - v.LastPredictedHit > PredictedFlashSec) Flash(v); // своё попадание уже мигнуло
+            }
+            else if (serverHp > v.ServerHp01 + 0.001f)
+            {
+                v.GhostHp01 = serverHp; // возрождение
+            }
+            v.ServerHp01 = serverHp;
+
+            if (v.GhostHp01 > serverHp && now >= v.GhostHoldUntil)
+                v.GhostHp01 = Mathf.MoveTowards(v.GhostHp01, serverHp, GhostDrainPerSec * Time.deltaTime);
+            if (v.GhostHp01 < serverHp) v.GhostHp01 = serverHp;
+            return serverHp;
+        }
+
+        void AddDamageNumber(View v, float amount)
+        {
+            float now = Time.time;
+            foreach (var n in damageNumbers)
+            {
+                if (n.Id == v.Id && now - n.Born < DamageNumberMergeSec)
+                {
+                    n.Raw += amount;
+                    n.WorldPos = v.WorldPos;
+                    return;
+                }
+            }
+            if (damageNumbers.Count >= 32) damageNumbers.RemoveAt(0);
+            damageNumbers.Add(new DamageNumber
+            {
+                Id = v.Id, Raw = amount, Born = now, WorldPos = v.WorldPos, ToUs = v.Team == myTeam,
+            });
+        }
+
+        /// <summary>
+        /// Здоровье в снапшоте квантовано по 1/255 (≈ 12 единиц), поэтому разница даёт 694 или 706 вместо 700.
+        /// Урон в игре кратен 50 — округляем до 50 (малый остаток при добивании — до 10).
+        /// </summary>
+        static int ShownDamage(float raw)
+        {
+            float r50 = Mathf.Round(raw / 50f) * 50f;
+            return Mathf.RoundToInt(r50 > 0f ? r50 : Mathf.Round(raw / 10f) * 10f);
+        }
+
+        /// <summary>Квадрат расстояния от точки p до отрезка ab (как World.segmentDistSq).</summary>
+        static float SegmentDistSq(Vector2 a, Vector2 b, Vector2 p)
+        {
+            Vector2 ab = b - a;
+            float len2 = ab.sqrMagnitude;
+            float t = len2 > 0f ? Mathf.Clamp01(Vector2.Dot(p - a, ab) / len2) : 0f;
+            return (a + ab * t - p).sqrMagnitude;
+        }
+
+        static void Flash(View v) => v.FlashUntil = Time.time + HitFlashSec;
+
+        static void UpdateHitFlash(View v)
+        {
+            if (v.Body == null) return;
+            bool flash = Time.time < v.FlashUntil;
+            if (flash == v.Flashing) return;
+            v.Flashing = flash;
+            v.Body.GetComponent<Renderer>().material.color = flash ? HitFlashColor : v.BodyColor;
         }
 
         View CreateView(EntityState e)
@@ -799,7 +939,8 @@ namespace UGame.Game
                 view.SuperGlow = glow;
 
                 // тело — свой цвет у каждого персонажа
-                var body = Primitive(PrimitiveType.Capsule, root.transform, BrawlerPalette[e.Id % BrawlerPalette.Length]);
+                view.BodyColor = BrawlerPalette[e.Id % BrawlerPalette.Length];
+                var body = Primitive(PrimitiveType.Capsule, root.transform, view.BodyColor);
                 body.localScale = new Vector3(1f, 0.8f, 1f);
                 body.localPosition = new Vector3(0f, 0.8f, 0f);
                 view.Body = body;
@@ -957,10 +1098,53 @@ namespace UGame.Game
                 const float bw = 70f, bh = 9f;
                 GUI.color = new Color(0f, 0f, 0f, 0.7f);
                 GUI.DrawTexture(new Rect(x - bw / 2 - 1, y - 11, bw + 2, bh + 2), Texture2D.whiteTexture);
+                if (v.GhostHp01 > v.Hp01) // только что отнятое — белым, стекает за текущей полоской
+                {
+                    GUI.color = GhostBarColor;
+                    GUI.DrawTexture(new Rect(x - bw / 2, y - 10, bw * v.GhostHp01, bh), Texture2D.whiteTexture);
+                }
                 GUI.color = v.Team == myTeam ? new Color(0.3f, 0.9f, 0.35f) : new Color(0.95f, 0.25f, 0.2f);
                 GUI.DrawTexture(new Rect(x - bw / 2, y - 10, bw * v.Hp01, bh), Texture2D.whiteTexture);
                 GUI.color = prev;
             }
+            DrawDamageNumbers(guiScale);
+        }
+
+        /// <summary>Цифры урона: всплывают над бойцом, в начале чуть крупнее, к концу гаснут.</summary>
+        void DrawDamageNumbers(float guiScale)
+        {
+            damageStyle ??= new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleCenter, fontStyle = FontStyle.Bold, fontSize = 18,
+                normal = { textColor = Color.white },
+            };
+            float now = Time.time;
+            var prev = GUI.color;
+            for (int i = damageNumbers.Count - 1; i >= 0; i--)
+            {
+                var n = damageNumbers[i];
+                float age = now - n.Born;
+                if (age > DamageNumberSec)
+                {
+                    damageNumbers.RemoveAt(i);
+                    continue;
+                }
+                Vector3 anchor = views.TryGetValue(n.Id, out var nv) && nv.Root.activeSelf ? nv.WorldPos : n.WorldPos;
+                Vector3 sp = cam.WorldToScreenPoint(anchor + Vector3.up * (2.9f + age * 1.5f));
+                if (sp.z < 0) continue;
+                float x = sp.x / guiScale, y = (Screen.height - sp.y) / guiScale;
+                float alpha = 1f - Mathf.Clamp01((age - DamageNumberSec * 0.5f) / (DamageNumberSec * 0.5f));
+                int size = Mathf.RoundToInt(age < 0.12f ? 24f - age * 50f : 18f); // «удар» при появлении
+                damageStyle.fontSize = size;
+                string text = ShownDamage(n.Raw).ToString();
+                var rect = new Rect(x - 50, y - 15, 100, 30);
+                GUI.color = new Color(0f, 0f, 0f, 0.8f * alpha);
+                GUI.Label(new Rect(rect.x + 1.5f, rect.y + 1.5f, rect.width, rect.height), text, damageStyle);
+                var c = n.ToUs ? DamageToUsColor : DamageToEnemyColor;
+                GUI.color = new Color(c.r, c.g, c.b, alpha);
+                GUI.Label(rect, text, damageStyle);
+            }
+            GUI.color = prev;
         }
     }
 }
