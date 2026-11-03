@@ -6,8 +6,9 @@
 //   MatchView.Input.cs         — ввод: клавиатура, мышь, джойстики, отправка команд
 //   MatchView.Prediction.cs    — свой боец: предсказание и сверка со снапшотом (reconciliation)
 //   MatchView.Shots.cs         — свои выстрелы: сразу на экране, сверка с сервером
+//   MatchView.RemoteShots.cs   — чужие снаряды: полёт по событиям «выстрел» и «попадание»
 //   MatchView.Interpolation.cs — буфер снапшотов и часы отрисовки чужих (с задержкой ~100 мс)
-//   MatchView.Scene.cs         — объекты на сцене, арена, камера
+//   MatchView.Scene.cs         — бойцы на сцене, арена, камера
 //   MatchView.Health.cs        — здоровье: «призрачная» полоска, цифры урона, вспышки
 //   MatchView.Overlay.cs       — интерфейс поверх сцены (OnGUI)
 // Правила игры (скорости, радиусы, кулдауны) — в GameRules.cs, они должны совпадать с сервером.
@@ -80,6 +81,7 @@ namespace UGame.Game
         public void OnSnapshot(Snapshot s)
         {
             if (!AddSnapshot(s)) return; // старый или дубль (UDP)
+            ApplyShotEvents(s);
             Reconcile(s);
         }
 
@@ -91,6 +93,7 @@ namespace UGame.Game
             AdvanceClock(dt);
             DecayCorrection(dt);
             UpdateViews();
+            UpdateRemoteShots();
             UpdateShots(dt);
             UpdateAimLine();
             UpdateCamera(dt);

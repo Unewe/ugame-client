@@ -39,6 +39,7 @@ namespace UGame.Net
         public ByteWriter U8(int v) { Ensure(1); buf[pos++] = (byte)v; return this; }
         public ByteWriter I8(int v) => U8((sbyte)v);
         public ByteWriter U16(int v) { Ensure(2); buf[pos++] = (byte)v; buf[pos++] = (byte)(v >> 8); return this; }
+        public ByteWriter U32(uint v) => U16((int)(v & 0xFFFF)).U16((int)(v >> 16));
 
         public ByteWriter Bytes(byte[] src, int offset, int count)
         {
@@ -114,11 +115,13 @@ namespace UGame.Net
     {
         public const int MaxCommands = 4;
 
+        /// <param name="ackSnapshotTick">тик последнего полученного снапшота (0 — ещё ни одного):
+        /// события снарядов до него сервер больше не повторяет</param>
         /// <param name="newestFirst">команды от НОВОЙ к старой</param>
-        public static void Write(ByteWriter w, IReadOnlyList<InputCommand> newestFirst)
+        public static void Write(ByteWriter w, uint ackSnapshotTick, IReadOnlyList<InputCommand> newestFirst)
         {
             int count = Math.Min(newestFirst.Count, MaxCommands);
-            w.U8(MessageType.C2S_Input).U8(count);
+            w.U8(MessageType.C2S_Input).U32(ackSnapshotTick).U8(count);
             for (int i = 0; i < count; i++)
             {
                 var c = newestFirst[i];
@@ -128,7 +131,7 @@ namespace UGame.Net
         }
     }
 
-    public enum EntityKind : byte { Brawler = 1, Projectile = 2 }
+    public enum EntityKind : byte { Brawler = 1 }
 
     [Flags]
     public enum EntityFlags : byte
@@ -136,7 +139,6 @@ namespace UGame.Net
         None = 0,
         Dodging = 1,      // боец в рывке и неуязвим
         SuperReady = 2,   // у бойца заряжен супер
-        SuperShot = 4,    // снаряд супер удара
     }
 
     public struct EntityState
@@ -145,10 +147,28 @@ namespace UGame.Net
         public EntityKind Kind;
         public Vector2 Pos;   // метры, координаты арены
         public float Aim;     // радианы
-        public float Hp01;    // 0..1, 0 — мёртв (только у бойцов)
-        public byte Owner;    // снаряд: id бойца, который его выпустил
+        public float Hp01;    // 0..1, 0 — мёртв
         public byte Team;
         public EntityFlags Flags;
+    }
+
+    /// <summary>Событие «выстрел»: снаряд вылетел в тике Tick из Origin в направлении Angle.</summary>
+    public struct ShotSpawn
+    {
+        public ushort Id;
+        public uint Tick;
+        public Vector2 Origin;  // метры
+        public float Angle;     // радианы
+        public byte Owner;      // id бойца-стрелка
+        public byte Team;
+        public bool IsSuper;
+    }
+
+    /// <summary>Событие «попадание»: снаряд Id исчез в тике Tick.</summary>
+    public struct ShotHit
+    {
+        public ushort Id;
+        public uint Tick;
     }
 
     public sealed class Snapshot
@@ -168,6 +188,10 @@ namespace UGame.Net
 
         public bool SuperReady => SuperCharge >= 255;
         public readonly List<EntityState> Entities = new List<EntityState>();
+        public readonly List<ShotSpawn> ShotSpawns = new List<ShotSpawn>();
+        public readonly List<ShotHit> ShotHits = new List<ShotHit>();
+
+        const int ShotKindSuper = 1; // SnapshotPacket.ShotKind.SUPER
 
         /// <summary>Читает пакет БЕЗ первого байта типа.</summary>
         public static Snapshot ReadBody(ByteReader r)
@@ -189,20 +213,34 @@ namespace UGame.Net
             int count = r.U8();
             for (int i = 0; i < count; i++)
             {
-                var e = new EntityState
+                s.Entities.Add(new EntityState
                 {
                     Id = (ushort)r.U16(),
                     Kind = (EntityKind)r.U8(),
                     Pos = new Vector2(Quantize.I16ToPos(r.I16()), Quantize.I16ToPos(r.I16())),
                     Aim = Quantize.U16ToAngle(r.U16()),
-                };
-                int hpOrOwner = r.U8(); // у снаряда в этом байте — id владельца
-                if (e.Kind == EntityKind.Projectile) e.Owner = (byte)hpOrOwner;
-                else e.Hp01 = hpOrOwner / 255f;
-                e.Team = (byte)r.U8();
-                e.Flags = (EntityFlags)r.U8();
-                s.Entities.Add(e);
+                    Hp01 = r.U8() / 255f,
+                    Team = (byte)r.U8(),
+                    Flags = (EntityFlags)r.U8(),
+                });
             }
+            int spawns = r.U8();
+            for (int i = 0; i < spawns; i++)
+            {
+                s.ShotSpawns.Add(new ShotSpawn
+                {
+                    Id = (ushort)r.U16(),
+                    Tick = s.Tick - (uint)r.U8(),
+                    Origin = new Vector2(Quantize.I16ToPos(r.I16()), Quantize.I16ToPos(r.I16())),
+                    Angle = Quantize.U16ToAngle(r.U16()),
+                    Owner = (byte)r.U8(),
+                    Team = (byte)r.U8(),
+                    IsSuper = r.U8() == ShotKindSuper,
+                });
+            }
+            int hits = r.U8();
+            for (int i = 0; i < hits; i++)
+                s.ShotHits.Add(new ShotHit { Id = (ushort)r.U16(), Tick = s.Tick - (uint)r.U8() });
             return s;
         }
     }

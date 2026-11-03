@@ -77,11 +77,11 @@ namespace UGame.Net
         /// <summary>В конце кадра: отправить всё накопленное.</summary>
         public void Flush() => client.TickOutgoing();
 
-        public void SendInputs(IReadOnlyList<InputCommand> newestFirst)
+        public void SendInputs(uint ackSnapshotTick, IReadOnlyList<InputCommand> newestFirst)
         {
             if (!client.connected) return;
             writer.Reset();
-            InputPacket.Write(writer, newestFirst);
+            InputPacket.Write(writer, ackSnapshotTick, newestFirst);
             client.Send(writer.Segment, KcpChannel.Unreliable);
         }
 

@@ -1,4 +1,5 @@
-// Объекты на сцене: бойцы и снаряды из снапшотов, арена, камера. Всё строится из примитивов.
+// Объекты на сцене: бойцы из снапшотов, арена, камера. Всё строится из примитивов.
+// Снаряды — в MatchView.Shots.cs (свои) и MatchView.RemoteShots.cs (чужие).
 using System.Collections.Generic;
 using UGame.Net;
 using UnityEngine;
@@ -34,11 +35,10 @@ namespace UGame.Game
             new Color(0.20f, 0.30f, 0.65f), // тёмно-синий
         };
 
-        /// <summary>Боец или снаряд на сцене.</summary>
+        /// <summary>Боец на сцене.</summary>
         sealed class View
         {
             public GameObject Root;
-            public EntityKind Kind;
             public ushort Id;
             public byte Team;
             public bool Seen;          // есть в текущем снапшоте; нет — объект удаляется
@@ -74,11 +74,7 @@ namespace UGame.Game
             foreach (var v in views.Values) v.Seen = false;
 
             foreach (var e in to.Entities)
-            {
-                // свои снаряды рисуем по предсказанию (MatchView.Shots.cs), серверную копию — нет
-                if (e.Kind == EntityKind.Projectile && e.Owner == myEntityId) continue;
-                SyncView(e, t);
-            }
+                if (e.Kind == EntityKind.Brawler) SyncView(e, t);
 
             toRemove.Clear();
             foreach (var kv in views)
@@ -100,8 +96,7 @@ namespace UGame.Game
             view.Seen = true;
             view.Team = e.Team;
 
-            bool isBrawler = e.Kind == EntityKind.Brawler;
-            bool isOwn = isBrawler && e.Id == myEntityId;
+            bool isOwn = e.Id == myEntityId;
             Vector2 pos;
             float aim;
             if (isOwn && predicting)
@@ -116,7 +111,6 @@ namespace UGame.Game
             view.WorldPos = new Vector3(pos.x, 0f, pos.y);
             view.Root.transform.SetPositionAndRotation(view.WorldPos,
                 Quaternion.LookRotation(new Vector3(Mathf.Cos(aim), 0f, Mathf.Sin(aim))));
-            if (!isBrawler) return;
 
             // Жив ли боец — по интерполированному снапшоту (в такт его позиции), а полоска
             // здоровья — по последнему, как у своего: иначе урон по врагам виден на 100 мс позже.
@@ -167,45 +161,35 @@ namespace UGame.Game
 
         View CreateView(EntityState e)
         {
-            var root = new GameObject(e.Kind + " " + e.Id);
+            var root = new GameObject("Brawler " + e.Id);
             root.transform.SetParent(transform, false);
-            bool ally = e.Team == myTeam;
-            var view = new View { Root = root, Kind = e.Kind, Id = e.Id, Team = e.Team };
+            var view = new View { Root = root, Id = e.Id, Team = e.Team };
 
-            if (e.Kind == EntityKind.Brawler)
-            {
-                // кольцо под ногами — цвет команды
-                view.Ring = Primitive(PrimitiveType.Cylinder, root.transform, ally ? AllyColor : EnemyColor);
-                view.Ring.localScale = new Vector3(1.5f, 0.02f, 1.5f);
-                view.Ring.localPosition = new Vector3(0f, 0.02f, 0f);
+            // кольцо под ногами — цвет команды
+            view.Ring = Primitive(PrimitiveType.Cylinder, root.transform, e.Team == myTeam ? AllyColor : EnemyColor);
+            view.Ring.localScale = new Vector3(1.5f, 0.02f, 1.5f);
+            view.Ring.localPosition = new Vector3(0f, 0.02f, 0f);
 
-                // свечение заряженного супера
-                view.SuperGlow = NoShadow(Primitive(PrimitiveType.Cylinder, root.transform, SuperGlowColor));
-                view.SuperGlow.localScale = new Vector3(2.1f, 0.01f, 2.1f);
-                view.SuperGlow.localPosition = new Vector3(0f, 0.01f, 0f);
-                view.SuperGlow.gameObject.SetActive(false);
+            // свечение заряженного супера
+            view.SuperGlow = NoShadow(Primitive(PrimitiveType.Cylinder, root.transform, SuperGlowColor));
+            view.SuperGlow.localScale = new Vector3(2.1f, 0.01f, 2.1f);
+            view.SuperGlow.localPosition = new Vector3(0f, 0.01f, 0f);
+            view.SuperGlow.gameObject.SetActive(false);
 
-                // тело — свой цвет у каждого персонажа
-                view.BodyColor = BrawlerPalette[e.Id % BrawlerPalette.Length];
-                view.Body = Primitive(PrimitiveType.Capsule, root.transform, view.BodyColor);
-                view.Body.localScale = new Vector3(1f, 0.8f, 1f);
-                view.Body.localPosition = new Vector3(0f, 0.8f, 0f);
+            // тело — свой цвет у каждого персонажа
+            view.BodyColor = BrawlerPalette[e.Id % BrawlerPalette.Length];
+            view.Body = Primitive(PrimitiveType.Capsule, root.transform, view.BodyColor);
+            view.Body.localScale = new Vector3(1f, 0.8f, 1f);
+            view.Body.localPosition = new Vector3(0f, 0.8f, 0f);
 
-                // «ствол» показывает направление прицела
-                view.Gun = Primitive(PrimitiveType.Cube, root.transform, GunColor);
-                view.Gun.localScale = new Vector3(0.22f, 0.22f, 0.8f);
-                view.Gun.localPosition = new Vector3(0f, 0.9f, 0.6f);
-            }
-            else
-            {
-                bool superShot = (e.Flags & EntityFlags.SuperShot) != 0;
-                var shot = CreateShotBody(root.transform, superShot, ally ? AllyShotColor : EnemyShotColor);
-                shot.localPosition = new Vector3(0f, ShotHeight, 0f);
-            }
+            // «ствол» показывает направление прицела
+            view.Gun = Primitive(PrimitiveType.Cube, root.transform, GunColor);
+            view.Gun.localScale = new Vector3(0.22f, 0.22f, 0.8f);
+            view.Gun.localPosition = new Vector3(0f, 0.9f, 0.6f);
             return view;
         }
 
-        /// <summary>Шарик снаряда: и для серверных снарядов, и для своих предсказанных.</summary>
+        /// <summary>Шарик снаряда: и для своих предсказанных, и для чужих.</summary>
         static Transform CreateShotBody(Transform parent, bool isSuper, Color color)
         {
             var shot = NoShadow(Primitive(PrimitiveType.Sphere, parent, isSuper ? SuperShotColor : color));

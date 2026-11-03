@@ -84,7 +84,7 @@ namespace UGame.Game
 
             history.Insert(0, cmd);
             if (history.Count > InputPacket.MaxCommands) history.RemoveAt(history.Count - 1);
-            conn.SendInputs(history);
+            conn.SendInputs(Latest != null ? Latest.Tick : 0u, history); // + подтверждение снапшота
 
             if (predicting) PredictCommand(cmd);
         }
@@ -236,7 +236,7 @@ namespace UGame.Game
             bool found = false;
             foreach (var v in views.Values)
             {
-                if (v.Kind != EntityKind.Brawler || v.Team == myTeam || !v.Root.activeSelf) continue;
+                if (v.Team == myTeam || !v.Root.activeSelf) continue;
                 Vector2 p = new Vector2(v.WorldPos.x, v.WorldPos.z);
                 float d = (p - own).sqrMagnitude;
                 if (d < best) { best = d; pos = p; found = true; }

@@ -1,6 +1,5 @@
 // Интерфейс поверх сцены (OnGUI): имена и полоски здоровья, цифры урона, полоска способностей
 // для мыши и клавиатуры (на телефоне её рисуют джойстики TouchControls).
-using UGame.Net;
 using UnityEngine;
 
 namespace UGame.Game
@@ -28,7 +27,7 @@ namespace UGame.Game
                 else DrawAbilityBar(guiScale);
             }
             foreach (var v in views.Values)
-                if (v.Kind == EntityKind.Brawler && v.Root.activeSelf) DrawNameAndHealth(v, guiScale, nameStyle);
+                if (v.Root.activeSelf) DrawNameAndHealth(v, guiScale, nameStyle);
             DrawDamageNumbers(guiScale);
         }
 

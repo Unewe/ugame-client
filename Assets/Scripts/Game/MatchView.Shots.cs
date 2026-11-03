@@ -1,5 +1,5 @@
-// Свои выстрелы. Снаряд появляется сразу при нажатии, а его серверная копия (у снаряда в снапшоте
-// есть id владельца) не рисуется. Сервер проверяет попадания по тем позициям врагов, что игрок
+// Свои выстрелы. Снаряд появляется сразу при нажатии, а событие «выстрел» от сервера для своих
+// снарядов пропускается (MatchView.RemoteShots.cs). Сервер проверяет попадания по тем позициям врагов, что игрок
 // видел на экране (компенсация лагов), поэтому попадание на экране почти всегда совпадает
 // с серверным. Выстрел, которого сервер не сделал (LastAttackSeq/LastSuperSeq в снапшоте), убирается.
 using System.Collections.Generic;
@@ -117,7 +117,7 @@ namespace UGame.Game
         {
             foreach (var v in views.Values)
             {
-                if (v.Kind != EntityKind.Brawler || v.Team == myTeam || v.Dodging || !v.Root.activeSelf) continue;
+                if (v.Team == myTeam || v.Dodging || !v.Root.activeSelf) continue;
                 if (SegmentDistSq(a, b, new Vector2(v.WorldPos.x, v.WorldPos.z)) > hitDist * hitDist) continue;
                 v.LastPredictedHit = Time.time;
                 Flash(v);
