@@ -78,7 +78,7 @@ namespace UGame.Game
             MyAlive = false;
             predicting = false;
             pending.Clear();
-            ResetQueuedInput();
+            DiscardQueuedInput();
             dash = new DashState { Cooldown = s.DodgeCooldownTicks };
         }
 

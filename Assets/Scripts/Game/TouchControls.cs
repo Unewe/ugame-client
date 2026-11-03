@@ -127,6 +127,20 @@ namespace UGame.Game
             return d;
         }
 
+        /// <summary>
+        /// Выбросить несработавшие нажатия и отпустить джойстики атаки и супера без выстрела (боец умер).
+        /// Палец, который так и остался на экране, выстрела уже не даст — нужно коснуться заново.
+        /// Джойстик движения не трогаем: после возрождения можно сразу бежать.
+        /// </summary>
+        public void CancelActions()
+        {
+            pendingFire = FireKind.None;
+            pendingSuper = FireKind.None;
+            pendingDodge = false;
+            attack.FingerId = -1;
+            super.FingerId = -1;
+        }
+
         static Vector2 Value(Stick s) => Vector2.ClampMagnitude((s.Current - s.Origin) / Radius, 1f);
 
         // ------------------------------------------------------------------ обработка касаний

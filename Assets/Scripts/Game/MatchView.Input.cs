@@ -1,6 +1,10 @@
 // Ввод: клавиатура и мышь или сенсорные джойстики. Нажатия запоминаются в кадре, а команды
 // уходят серверу 30 раз в секунду (по одной на тик клиента) — вместе с тремя предыдущими,
 // чтобы потеря UDP-пакета не теряла нажатие.
+//
+// Буфер нажатий короткий: нажатие, которое не ушло вовремя, устаревает (BufferedPress).
+// Пока боец мёртв, нажатия выбрасываются, включая зажатые джойстики, — после возрождения
+// действие требует нового нажатия, и случайный супер «из прошлой жизни» невозможен.
 using System.Collections.Generic;
 using UGame.Net;
 using UnityEngine;
@@ -11,6 +15,31 @@ namespace UGame.Game
     partial class MatchView
     {
         const float AutoAimRange = 10f;
+        // сколько живёт нажатие, которое ещё не ушло в команде
+        const float AbilityBufferSec = 0.2f;   // супер и рывок: не сработали сразу — значит, не нужно
+        const float AttackBufferSec = AttackCooldownSec + 0.1f; // атака ждёт конца перезарядки, но не дольше
+
+        /// <summary>Нажатие, которое ждёт отправки в команде. Старше срока — не срабатывает.</summary>
+        struct BufferedPress
+        {
+            float pressedAt;
+            bool active;
+
+            public void Press()
+            {
+                active = true;
+                pressedAt = Time.time;
+            }
+
+            public void Clear() => active = false;
+
+            /// <summary>Есть нажатие не старше maxAgeSec? Устаревшее заодно сбрасывается.</summary>
+            public bool IsFresh(float maxAgeSec)
+            {
+                if (active && Time.time - pressedAt > maxAgeSec) active = false;
+                return active;
+            }
+        }
 
         readonly List<InputCommand> history = new List<InputCommand>(InputPacket.MaxCommands);
         ushort nextSeq = 1;
@@ -19,10 +48,10 @@ namespace UGame.Game
         int lastShotSeq = -1;   // seq последней атаки — кулдаун считается в командах, как на сервере
 
         // нажатия, которые ещё не ушли в команде
-        bool superQueued, dodgeQueued;
-        bool attackQueued;      // клик короче интервала команд или на перезарядке
-        bool touchShotQueued;   // выстрел с телефона ждёт конца перезарядки…
-        float touchShotAim;     // …с тем прицелом, с которым его сделали
+        BufferedPress superPress, dodgePress;
+        BufferedPress attackPress;  // клик короче интервала команд или на перезарядке
+        BufferedPress touchShot;    // выстрел с телефона ждёт конца перезарядки…
+        float touchShotAim;         // …с тем прицелом, с которым его сделали
 
         bool superInFlight;     // супер отправлен, сервер ещё не подтвердил команду
         ushort superSentSeq;
@@ -45,11 +74,14 @@ namespace UGame.Game
                 touch.DodgeReady = DodgeReady;
                 touch.DodgeCooldownSec = DodgeCooldownLeftSec;
                 touch.Update();
-                if (touch.ConsumeDodge()) dodgeQueued = true;
+                if (touch.ConsumeDodge()) dodgePress.Press();
             }
-            if (InputReader.SuperPressed(includeMouse: touch == null)) superQueued = true;
-            if (InputReader.AttackPressed(includeMouse: touch == null)) attackQueued = true;
-            if (InputReader.DodgePressed()) dodgeQueued = true;
+            if (InputReader.SuperPressed(includeMouse: touch == null)) superPress.Press();
+            if (InputReader.AttackPressed(includeMouse: touch == null)) attackPress.Press();
+            if (InputReader.DodgePressed()) dodgePress.Press();
+
+            // команды не уходят (мёртв, матч не идёт) — нажатия этого времени не должны сработать потом
+            if (!Running || !MyAlive) DiscardQueuedInput();
         }
 
         void SendInputs(float dt)
@@ -110,19 +142,19 @@ namespace UGame.Game
                 // а выстрел из очереди спокойно уйдёт следующей командой
                 super = TouchSuper();
                 fire = !super && (TouchFire(worldMove, attackReady)
-                                  | (attackReady && (attackQueued || InputReader.Attack(includeMouse: false))));
+                                  | (attackReady && (attackPress.IsFresh(AttackBufferSec) || InputReader.Attack(includeMouse: false))));
             }
             else
             {
                 UpdateMouseAim();
-                fire = attackReady && (attackQueued || InputReader.Attack(includeMouse: true));
+                fire = attackReady && (attackPress.IsFresh(AttackBufferSec) || InputReader.Attack(includeMouse: true));
             }
-            if (superQueued && SuperReady) super = true;
-            superQueued = false;
+            if (superPress.IsFresh(AbilityBufferSec) && SuperReady) super = true;
+            superPress.Clear();
 
             // готовность рывка проверяет Step — ровно так же, как сервер; на кулдауне нажатие ничего не делает
-            bool dodge = dodgeQueued && !Dashing;
-            dodgeQueued = false;
+            bool dodge = dodgePress.IsFresh(AbilityBufferSec) && !Dashing;
+            dodgePress.Clear();
 
             var buttons = Buttons.None;
             if (fire) buttons |= Buttons.Attack;
@@ -136,7 +168,7 @@ namespace UGame.Game
             if ((cmd.Buttons & Buttons.Attack) != 0)
             {
                 lastShotSeq = cmd.Seq;
-                attackQueued = false;
+                attackPress.Clear();
             }
             if ((cmd.Buttons & Buttons.Super) != 0)
             {
@@ -151,11 +183,18 @@ namespace UGame.Game
             if (superInFlight && !Quantize.SeqGreater(superSentSeq, ack)) superInFlight = false;
         }
 
-        /// <summary>Боец умер — нажатия, сделанные до смерти, никуда не уходят.</summary>
-        void ResetQueuedInput()
+        /// <summary>
+        /// Выбросить всё, что нажато и ещё не ушло: боец мёртв, нажатия этого времени не должны
+        /// сработать после возрождения. Зажатые джойстики атаки и супера тоже отпускаются без выстрела.
+        /// </summary>
+        void DiscardQueuedInput()
         {
-            touchShotQueued = false;
-            superQueued = dodgeQueued = superInFlight = attackQueued = false;
+            superPress.Clear();
+            dodgePress.Clear();
+            attackPress.Clear();
+            touchShot.Clear();
+            superInFlight = false;
+            touch?.CancelActions();
         }
 
         // ------------------------------------------------------------------ прицел
@@ -189,11 +228,11 @@ namespace UGame.Game
         {
             if (TouchAim(worldMove))
             {
-                touchShotQueued = true;
+                touchShot.Press();
                 touchShotAim = myAim;
             }
-            if (!touchShotQueued || !attackReady) return false;
-            touchShotQueued = false;
+            if (!touchShot.IsFresh(AttackBufferSec) || !attackReady) return false;
+            touchShot.Clear();
             myAim = touchShotAim;
             return true;
         }
