@@ -27,7 +27,6 @@ namespace UGame.Net
 
         public ByteWriter(int capacity = 256) { buf = new byte[capacity]; }
 
-        public int Size => pos;
         public ArraySegment<byte> Segment => new ArraySegment<byte>(buf, 0, pos);
 
         public ByteWriter Reset() { pos = 0; return this; }

@@ -51,8 +51,6 @@ namespace UGame.Net
             client = new KcpClient(OnConnected, OnData, OnDisconnected, OnError, Config());
         }
 
-        public bool IsConnected => client.connected;
-
         /// <summary>
         /// Время приёма-ответа до сервера, мс; -1 — ещё не измерено. kcp2k шлёт Ping раз в секунду,
         /// сервер возвращает его время в Pong (KcpConnection.java).
